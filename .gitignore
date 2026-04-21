@@ -6,6 +6,7 @@ __pycache__/
 .Python
 env/
 venv/
+virt/
 ENV/
 build/
 dist/
@@ -25,7 +26,8 @@ dist/
 Thumbs.db
 
 # Data files
-*.s2p
 *.s1p
+*.s2p
+*.s3p
 *.s4p
 *.snp

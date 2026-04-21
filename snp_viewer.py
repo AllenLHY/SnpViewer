@@ -2,12 +2,11 @@ import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
-from io import StringIO
 import os
 import warnings
+import tempfile
 import skrf as rf
 import numpy as np
-import hashlib
 
 # 抑制 Plotly 的過時參數警告
 warnings.filterwarnings('ignore', message='.*keyword arguments have been deprecated.*')
@@ -19,54 +18,16 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# 隱藏 Streamlit 預設的 UI 元素
-hide_streamlit_style = """
-<style>
-/* 隱藏右上角的漢堡選單（包含 "View app source"）*/
-#MainMenu {visibility: hidden;}
-
-/* 隱藏頁尾 */
-footer {visibility: hidden;}
-
-/* 隱藏頂部 header */
-header {visibility: hidden;}
-
-/* 隱藏工具列 */
-div[data-testid="stToolbar"] {display: none;}
-
-/* 隱藏右上角按鈕 */
-button[kind="header"] {display: none;}
-
-/* 隱藏 Deploy 按鈕 */
-.stDeployButton {display: none;}
-
-/* 隱藏狀態列 */
-div[data-testid="stStatusWidget"] {display: none;}
-</style>
-"""
-st.markdown(hide_streamlit_style, unsafe_allow_html=True)
-
 st.title("📊 S-parameter Viewer")
 st.write("Upload multiple .snp files (.s1p, .s2p, .s4p, etc.) for plotting comparison and analysis")
 
 # ============== 解析 S-parameter 檔案的函數 ==============
 
-def get_file_hash(file_content):
-    """計算檔案內容的 hash,用於快取 key"""
-    return hashlib.md5(file_content.encode('utf-8')).hexdigest()
-
-
-@st.cache_data(ttl=3600)  # 快取 1 小時
+@st.cache_data(ttl=3600)
 def parse_sparameter_file_cached(filename, file_content):
-    """
-    用 SKRF 解析 .snp 檔案(支持任意 port 數)
-    返回 DataFrame
-    此函數被快取,避免重複解析
-    """
     try:
-        # 寫入臨時檔案讓 SKRF 讀取
-        import tempfile
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.s2p', delete=False) as tmp:
+        suffix = os.path.splitext(filename)[1]
+        with tempfile.NamedTemporaryFile(mode='w', suffix=suffix, delete=False) as tmp:
             tmp.write(file_content)
             tmp_path = tmp.name
         
@@ -76,36 +37,18 @@ def parse_sparameter_file_cached(filename, file_content):
         # 清理臨時檔案
         os.remove(tmp_path)
         
-        # 轉換為 DataFrame
-        freq = network.frequency.f  # 頻率
-        
-        # 構建 S-parameter 列
-        data_dict = {'Frequency': freq}
-        
-        # 取得 port 數
+        freq = network.frequency.f
         n_ports = network.number_of_ports
-        
-        # 為每個 S-parameter 添加 magnitude 和 phase
+        data_dict = {'Frequency': freq}
         for i in range(n_ports):
             for j in range(n_ports):
                 s_param = network.s[:, i, j]
                 param_name = f'S{i+1}{j+1}'
-                data_dict[f'{param_name}_mag'] = 20 * np.log10(np.abs(s_param) + 1e-12)  # 轉成 dB,加小值避免 log(0)
-                data_dict[f'{param_name}_phase'] = np.angle(s_param, deg=True)    # 轉成度數
-        
-        df = pd.DataFrame(data_dict)
-        
-        return df
-    
+                data_dict[f'{param_name}_mag'] = 20 * np.log10(np.abs(s_param) + 1e-12)
+                data_dict[f'{param_name}_phase'] = np.angle(s_param, deg=True)
+        return pd.DataFrame(data_dict)
     except Exception as e:
         raise Exception(f"SKRF parsing failed: {str(e)}")
-
-
-def parse_sparameter_file(file_content, filename):
-    """
-    包裝函數,透過快取版本解析
-    """
-    return parse_sparameter_file_cached(filename, file_content)
 
 
 def get_available_parameters(df):
@@ -288,12 +231,10 @@ def add_markers_to_plot(fig, markers_list, visible_files, selected_param_full, f
     return marker_values
 
 
-# ============== Session State 初始化 ==============
-# 用於追蹤上傳的檔案,便於快取管理
-if 'uploaded_file_names' not in st.session_state:
-    st.session_state.uploaded_file_names = []
+DEFAULT_MARKER_COLORS = ["#FF0000", "#00FF00", "#0000FF", "#FF00FF", "#FFFF00",
+                         "#00FFFF", "#FFA500", "#800080", "#FFC0CB", "#A52A2A"]
 
-# 用於追蹤檔案勾選狀態
+# ============== Session State 初始化 ==============
 if 'file_checkboxes' not in st.session_state:
     st.session_state.file_checkboxes = {}
 
@@ -306,44 +247,6 @@ if 'marker_freqs' not in st.session_state:
 # 用於追蹤是否自訂 marker 樣式
 if 'custom_marker_style' not in st.session_state:
     st.session_state.custom_marker_style = False
-
-
-# # ============== CSS 樣式 ==============
-# # 為檔案上傳區域添加 hover 和 drag over 效果
-# st.markdown("""
-# <style>
-#     /* 檔案上傳區域的樣式 */
-#     [data-testid="stFileUploader"] {
-#         transition: all 0.3s ease;
-#     }
-    
-#     /* Hover 效果 */
-#     [data-testid="stFileUploader"]:hover {
-#         border-color: #1f77b4 !important;
-#         box-shadow: 0 0 10px rgba(31, 119, 180, 0.3);
-#     }
-    
-#     /* 檔案上傳區域內的文字容器 */
-#     [data-testid="stFileUploader"] section {
-#         transition: all 0.3s ease;
-#     }
-    
-#     /* Hover 時的文字容器效果 */
-#     [data-testid="stFileUploader"]:hover section {
-#         background-color: rgba(31, 119, 180, 0.05);
-#     }
-    
-#     /* Drag over 效果(使用 CSS 偽類) */
-#     [data-testid="stFileUploader"] [data-baseweb="file-uploader"] {
-#         transition: all 0.3s ease;
-#     }
-    
-#     [data-testid="stFileUploader"] [data-baseweb="file-uploader"]:hover {
-#         background-color: rgba(31, 119, 180, 0.08);
-#         border: 2px dashed #1f77b4 !important;
-#     }
-# </style>
-# """, unsafe_allow_html=True)
 
 
 # ============== 側邊欄設置 ==============
@@ -374,7 +277,7 @@ else:
             progress_placeholder.info(f"⏳ Reading {uploaded_file.name}... ({idx+1}/{len(uploaded_files)})")
             
             content = uploaded_file.read().decode('utf-8')
-            df = parse_sparameter_file(content, uploaded_file.name)
+            df = parse_sparameter_file_cached(uploaded_file.name, content)
             files_data[uploaded_file.name] = {'df': df}
             
         except Exception as e:
@@ -492,15 +395,6 @@ else:
         
         markers_list = []
         if num_markers > 0:
-            # 先顯示輸入區(簡化或詳細版本取決於是否自訂樣式)
-            # 但需要先知道是否勾選自訂樣式,所以我們需要先定義這個變數
-            
-            # 預先定義自訂樣式選項(在輸入區之前)
-            # 使用一個臨時的 key 來儲存狀態
-            if 'custom_marker_style' not in st.session_state:
-                st.session_state.custom_marker_style = False
-            
-            # 未勾選自訂樣式:簡化介面,只顯示頻率輸入
             if not st.session_state.custom_marker_style:
                 st.sidebar.caption("💡 Enter marker frequencies")
                 # 使用 container 讓輸入區可滾動
@@ -522,16 +416,9 @@ else:
                             help=f"Frequency position for Marker {i+1}"
                         )
                         
-                        # 更新 session state
                         st.session_state.marker_freqs[i] = marker_freq
-                        
-                        # 標籤名稱就是頻率值
                         marker_label = f"{marker_freq:.3f}"
-                        
-                        # 預設顏色和樣式
-                        default_colors = ["#FF0000", "#00FF00", "#0000FF", "#FF00FF", "#FFFF00", 
-                                        "#00FFFF", "#FFA500", "#800080", "#FFC0CB", "#A52A2A"]
-                        marker_color = default_colors[i % 10]
+                        marker_color = DEFAULT_MARKER_COLORS[i % 10]
                         marker_style = "both"
                         
                         markers_list.append({
@@ -602,17 +489,12 @@ else:
                             # 更新 session state
                             st.session_state.marker_labels[i] = marker_label
                             
-                            # 預設顏色和樣式
-                            default_colors = ["#FF0000", "#00FF00", "#0000FF", "#FF00FF", "#FFFF00", 
-                                            "#00FFFF", "#FFA500", "#800080", "#FFC0CB", "#A52A2A"]
-                            
-                            # 顏色和樣式使用水平排列
                             col_marker1, col_marker2 = st.columns(2)
-                            
+
                             with col_marker1:
                                 marker_color = st.color_picker(
                                     "Color",
-                                    value=default_colors[i % 10],
+                                    value=DEFAULT_MARKER_COLORS[i % 10],
                                     key=f"marker_color_{i}",
                                     help="Marker color"
                                 )
@@ -684,10 +566,6 @@ else:
             if st.session_state.file_checkboxes.get(filename, True):
                 visible_files[filename] = files_data[filename]
         
-        # 圖表設定
-        show_grid = True  # 預設顯示網格線
-        use_log_scale = False  # 不使用對數刻度
-        
         # 創建 Plotly 圖表
         if visible_files:
             fig = go.Figure()
@@ -706,8 +584,7 @@ else:
                 display_name = get_display_name(filename)
                 color = color_palette[idx % len(color_palette)]  # 循環使用顏色
                 
-                # 如果有marker,則不顯示線段的 legend(因為 marker 會顯示)
-                show_line_legend = not (num_markers > 0 and markers_list)
+                show_line_legend = not markers_list
                 
                 # 添加數據到圖表
                 fig.add_trace(go.Scatter(
@@ -726,17 +603,13 @@ else:
                     )
                 ))
             
-            # 添加自訂標記點
-            marker_values = None
-            if num_markers > 0 and markers_list:
-                marker_values = add_markers_to_plot(fig, markers_list, visible_files, selected_param_full, freq_unit, y_axis_unit, color_palette)
+            marker_values = add_markers_to_plot(fig, markers_list, visible_files, selected_param_full, freq_unit, y_axis_unit, color_palette) if markers_list else None
             
             # Layout 設定
             y_title = f"{selected_param_full} ({y_axis_unit})" if y_axis_unit else selected_param_full
             
-            # 計算圖表高度:根據 legend 項目數量動態調整
             base_height = 600
-            if num_markers > 0 and markers_list:
+            if markers_list:
                 # 計算顯示在 legend 中的 marker 數量
                 markers_in_legend = sum(1 for marker in markers_list if marker.get('show_in_legend', True))
                 
@@ -770,29 +643,23 @@ else:
                 },
                 'margin': {'t': 80, 'b': 80, 'l': 80, 'r': 150},
                 'xaxis': {
-                    'showgrid': show_grid,
+                    'showgrid': True,
                     'gridcolor': 'rgba(200, 200, 200, 0.3)',
                     'gridwidth': 1
                 },
                 'yaxis': {
-                    'showgrid': show_grid,
+                    'showgrid': True,
                     'gridcolor': 'rgba(200, 200, 200, 0.3)',
                     'gridwidth': 1
                 }
             }
-            
-            # 更新佈局
+
             fig.update_layout(**layout_config)
-            
-            # 設置 x 軸為對數刻度(如果需要)
-            if use_log_scale:
-                fig.update_xaxes(type="log")
-            
+
             st.plotly_chart(
-                fig, 
+                fig,
                 config={
                     'responsive': True,
-                    'width': 'stretch',
                     'displayModeBar': True,
                     'displaylogo': False,
                     'toImageButtonOptions': {
@@ -805,8 +672,7 @@ else:
                 }
             )
             
-            # ============== Marker Legend 表格 ==============
-            if num_markers > 0 and markers_list and marker_values:
+            if markers_list and marker_values:
                 st.subheader("📊 Marker Values Overview")
                 
                 # 重新組織資料:行為線段,列為各 marker
@@ -837,7 +703,7 @@ else:
                 # 設定檔案名稱為 index
                 legend_df = legend_df.set_index('File')
                 
-                st.dataframe(legend_df, width='stretch')
+                st.dataframe(legend_df, use_container_width=True)
             
             
             # 顯示數據統計(改為表格形式)- 根據頻率範圍過濾
@@ -864,7 +730,7 @@ else:
                 })
             
             stats_df = pd.DataFrame(stats_data)
-            st.dataframe(stats_df, width='stretch', hide_index=True)
+            st.dataframe(stats_df, use_container_width=True, hide_index=True)
             
             # 顯示原始數據表格
             with st.expander("📋 Show Raw Data Table"):
@@ -874,7 +740,7 @@ else:
                     # 顯示過濾後的數據
                     df_converted, _ = auto_convert_frequency(file_info['df'])
                     df_filtered = filter_by_frequency_range(df_converted, freq_range[0], freq_range[1])
-                    st.dataframe(df_filtered, width='stretch', hide_index=True)
+                    st.dataframe(df_filtered, use_container_width=True, hide_index=True)
         else:
             st.warning("⚠️ No files selected")
 
