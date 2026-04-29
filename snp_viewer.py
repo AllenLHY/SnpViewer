@@ -379,7 +379,54 @@ else:
         
         # 顯示選擇的頻率範圍
         st.sidebar.caption(f"📋 Range: {freq_range[0]:.3f} ~ {freq_range[1]:.3f} {freq_unit}")
-        
+
+        # ============== Amplitude 範圍選擇 ==============
+        st.sidebar.subheader("📏 Amplitude Range")
+
+        # 計算所有檔案在選定頻率範圍內的 amplitude 範圍
+        all_amp_values = []
+        for file_info in files_data.values():
+            df_c, _ = auto_convert_frequency(file_info['df'])
+            df_f = filter_by_frequency_range(df_c, freq_range[0], freq_range[1])
+            if selected_param_full in df_f.columns:
+                all_amp_values.extend(df_f[selected_param_full].dropna().tolist())
+
+        if all_amp_values:
+            amp_data_min = float(min(all_amp_values))
+            amp_data_max = float(max(all_amp_values))
+        else:
+            amp_data_min, amp_data_max = -100.0, 0.0
+
+        amp_padding = (amp_data_max - amp_data_min) * 0.05 if amp_data_max != amp_data_min else 1.0
+        amp_default_min = round(amp_data_min - amp_padding, 1)
+        amp_default_max = round(amp_data_max + amp_padding, 1)
+
+        col_amp1, col_amp2 = st.sidebar.columns(2)
+        with col_amp1:
+            amp_min_input = st.number_input(
+                f"Min ({y_axis_unit})",
+                value=amp_default_min,
+                step=1.0,
+                format="%.1f",
+                help=f"Minimum amplitude ({y_axis_unit})"
+            )
+        with col_amp2:
+            amp_max_input = st.number_input(
+                f"Max ({y_axis_unit})",
+                value=amp_default_max,
+                step=1.0,
+                format="%.1f",
+                help=f"Maximum amplitude ({y_axis_unit})"
+            )
+
+        if amp_min_input >= amp_max_input:
+            st.sidebar.warning("⚠️ Minimum value cannot be greater than maximum value")
+            amp_range = (amp_default_min, amp_default_max)
+        else:
+            amp_range = (amp_min_input, amp_max_input)
+
+        st.sidebar.caption(f"📋 Range: {amp_range[0]:.1f} ~ {amp_range[1]:.1f} {y_axis_unit}")
+
         # ============== Marker 功能 ==============
         st.sidebar.subheader("📍 Add Marker")
         
@@ -650,7 +697,8 @@ else:
                 'yaxis': {
                     'showgrid': True,
                     'gridcolor': 'rgba(200, 200, 200, 0.3)',
-                    'gridwidth': 1
+                    'gridwidth': 1,
+                    'range': [amp_range[0], amp_range[1]]
                 }
             }
 
