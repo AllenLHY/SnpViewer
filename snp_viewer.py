@@ -135,6 +135,79 @@ def find_nearest_value(df, freq_target, param_full):
     return df.loc[idx, 'Frequency'], df.loc[idx, param_full]
 
 
+def find_threshold_crossings(df, param_full, threshold):
+    """找出曲線穿越 threshold 的所有頻率點（線性插值）"""
+    freqs = df['Frequency'].values
+    values = df[param_full].values
+    crossings = []
+    for i in range(len(values) - 1):
+        v0 = values[i] - threshold
+        v1 = values[i + 1] - threshold
+        if v0 * v1 <= 0 and v0 != v1:
+            t = -v0 / (v1 - v0)
+            crossings.append(float(freqs[i] + t * (freqs[i + 1] - freqs[i])))
+    return crossings
+
+
+def add_threshold_markers_to_plot(fig, threshold_markers_list, visible_files, selected_param_full, freq_unit, y_axis_unit, color_palette):
+    """在圖表上添加 Threshold Marker（水平線 + 交叉點）"""
+    threshold_crossings = {}
+
+    for marker in threshold_markers_list:
+        threshold = marker['value']
+        marker_label = marker['label']
+        marker_color = marker['color']
+        show_in_legend = marker.get('show_in_legend', True)
+
+        threshold_crossings[marker_label] = {}
+
+        fig.add_hline(
+            y=threshold,
+            line_dash="dash",
+            line_color=marker_color,
+            line_width=2,
+            opacity=0.7,
+            annotation_text=marker_label,
+            annotation_position="right",
+            annotation_font_size=10,
+            annotation_font_color=marker_color
+        )
+
+        for idx, (filename, file_info) in enumerate(visible_files.items()):
+            df_c, _ = auto_convert_frequency(file_info['df'])
+            crossings = find_threshold_crossings(df_c, selected_param_full, threshold)
+            display_name = get_display_name(filename)
+            threshold_crossings[marker_label][display_name] = crossings
+
+            line_color = color_palette[idx % len(color_palette)]
+
+            for crossing_freq in crossings:
+                legend_text = f"{display_name} ✕ {marker_label}: {crossing_freq:.3f} {freq_unit}"
+                fig.add_trace(go.Scatter(
+                    x=[crossing_freq],
+                    y=[threshold],
+                    mode='markers',
+                    marker=dict(
+                        size=12,
+                        color=line_color,
+                        symbol='x',
+                        line=dict(width=2, color=marker_color)
+                    ),
+                    name=legend_text,
+                    legendgroup=f"threshold_{marker_label}",
+                    showlegend=show_in_legend,
+                    hovertemplate=(
+                        f"<b>{marker_label}</b><br>"
+                        f"{display_name}<br>"
+                        f"Frequency: {crossing_freq:.3f} {freq_unit}<br>"
+                        f"Threshold: {threshold:.1f} {y_axis_unit}<br>"
+                        "<extra></extra>"
+                    )
+                ))
+
+    return threshold_crossings
+
+
 def add_markers_to_plot(fig, markers_list, visible_files, selected_param_full, freq_unit, y_axis_unit, color_palette):
     """在圖表上添加自訂標記點"""
     
@@ -247,6 +320,12 @@ if 'marker_freqs' not in st.session_state:
 # 用於追蹤是否自訂 marker 樣式
 if 'custom_marker_style' not in st.session_state:
     st.session_state.custom_marker_style = False
+
+# 用於追蹤 threshold marker 數值與樣式
+if 'threshold_values' not in st.session_state:
+    st.session_state.threshold_values = {}
+if 'custom_threshold_style' not in st.session_state:
+    st.session_state.custom_threshold_style = False
 
 
 # ============== 側邊欄設置 ==============
@@ -570,7 +649,105 @@ else:
                                 'style': marker_style,
                                 'show_in_legend': show_in_legend
                             })
-        
+
+        # ============== Threshold Marker 功能 ==============
+        st.sidebar.subheader("📐 Threshold Marker")
+
+        num_threshold_markers = st.sidebar.number_input(
+            "Threshold Markers",
+            min_value=0,
+            max_value=5,
+            value=0,
+            step=1,
+            help="固定 Amplitude 值，標出每條曲線的交叉頻率點"
+        )
+
+        threshold_markers_list = []
+        if num_threshold_markers > 0:
+            if not st.session_state.custom_threshold_style:
+                st.sidebar.caption("💡 Enter threshold amplitude values")
+                threshold_simple_container = st.sidebar.container(height=250)
+                with threshold_simple_container:
+                    for i in range(int(num_threshold_markers)):
+                        default_val = st.session_state.threshold_values.get(i, -3.0)
+                        t_value = st.number_input(
+                            f"Threshold {i+1} ({y_axis_unit})",
+                            value=default_val,
+                            step=1.0,
+                            format="%.1f",
+                            key=f"threshold_value_{i}",
+                            help=f"Amplitude 門檻值 ({y_axis_unit})"
+                        )
+                        st.session_state.threshold_values[i] = t_value
+                        threshold_markers_list.append({
+                            'value': t_value,
+                            'label': f"{t_value:.1f} {y_axis_unit}",
+                            'color': DEFAULT_MARKER_COLORS[i % 10],
+                            'show_in_legend': True
+                        })
+
+                custom_threshold_new = st.sidebar.checkbox(
+                    "🎨 Customize Threshold Style",
+                    value=st.session_state.custom_threshold_style,
+                    help="Check to customize color and label for each threshold",
+                    key="custom_threshold_style_checkbox"
+                )
+                if custom_threshold_new != st.session_state.custom_threshold_style:
+                    st.session_state.custom_threshold_style = custom_threshold_new
+                    st.rerun()
+
+            else:
+                custom_threshold_new = st.sidebar.checkbox(
+                    "🎨 Customize Threshold Style",
+                    value=st.session_state.custom_threshold_style,
+                    help="Check to customize color and label for each threshold",
+                    key="custom_threshold_style_checkbox"
+                )
+                if custom_threshold_new != st.session_state.custom_threshold_style:
+                    st.session_state.custom_threshold_style = custom_threshold_new
+                    st.rerun()
+
+                threshold_container = st.sidebar.container(height=300)
+                with threshold_container:
+                    for i in range(int(num_threshold_markers)):
+                        with st.expander(f"📐 Threshold {i+1}", expanded=(i == 0)):
+                            default_val = st.session_state.threshold_values.get(i, -3.0)
+                            t_value = st.number_input(
+                                f"Value ({y_axis_unit})",
+                                value=default_val,
+                                step=1.0,
+                                format="%.1f",
+                                key=f"threshold_value_{i}",
+                                help=f"Amplitude 門檻值 ({y_axis_unit})"
+                            )
+                            if st.session_state.threshold_values.get(i) != t_value:
+                                st.session_state.threshold_values[i] = t_value
+                            t_label = st.text_input(
+                                "Label",
+                                value=f"{t_value:.1f} {y_axis_unit}",
+                                key=f"threshold_label_{i}",
+                                help="顯示在圖表上的標籤名稱"
+                            )
+                            col_t1, col_t2 = st.columns(2)
+                            with col_t1:
+                                t_color = st.color_picker(
+                                    "Color",
+                                    value=DEFAULT_MARKER_COLORS[i % 10],
+                                    key=f"threshold_color_{i}"
+                                )
+                            with col_t2:
+                                t_show_legend = st.checkbox(
+                                    "Show in Legend",
+                                    value=True,
+                                    key=f"threshold_show_legend_{i}"
+                                )
+                            threshold_markers_list.append({
+                                'value': t_value,
+                                'label': t_label,
+                                'color': t_color,
+                                'show_in_legend': t_show_legend
+                            })
+
         # 側邊欄:選擇要顯示的檔案(用 container 讓滾動更順暢)
         st.sidebar.subheader("📋 Select Files to Display")
         
@@ -651,6 +828,7 @@ else:
                 ))
             
             marker_values = add_markers_to_plot(fig, markers_list, visible_files, selected_param_full, freq_unit, y_axis_unit, color_palette) if markers_list else None
+            threshold_crossings = add_threshold_markers_to_plot(fig, threshold_markers_list, visible_files, selected_param_full, freq_unit, y_axis_unit, color_palette) if threshold_markers_list else None
             
             # Layout 設定
             y_title = f"{selected_param_full} ({y_axis_unit})" if y_axis_unit else selected_param_full
@@ -698,7 +876,10 @@ else:
                     'showgrid': True,
                     'gridcolor': 'rgba(200, 200, 200, 0.3)',
                     'gridwidth': 1,
-                    'range': [amp_range[0], amp_range[1]]
+                    'range': [
+                        min(amp_range[0], *[m['value'] for m in threshold_markers_list]) if threshold_markers_list else amp_range[0],
+                        max(amp_range[1], *[m['value'] for m in threshold_markers_list]) if threshold_markers_list else amp_range[1]
+                    ]
                 }
             }
 
@@ -752,8 +933,26 @@ else:
                 legend_df = legend_df.set_index('File')
                 
                 st.dataframe(legend_df, use_container_width=True)
-            
-            
+
+            if threshold_markers_list and threshold_crossings:
+                st.subheader("📐 Threshold Crossing Frequencies")
+                t_table = {}
+                for filename in visible_files.keys():
+                    display_name = get_display_name(filename)
+                    t_table[display_name] = {'File': display_name}
+
+                for t_label, file_crossings in threshold_crossings.items():
+                    col_name = f"Crossing Freq @ {t_label} ({freq_unit})"
+                    for display_name, crossings in file_crossings.items():
+                        if display_name in t_table:
+                            t_table[display_name][col_name] = (
+                                ", ".join(f"{f:.3f}" for f in crossings) if crossings else "—"
+                            )
+
+                t_df = pd.DataFrame(list(t_table.values())).set_index('File')
+                st.dataframe(t_df, use_container_width=True)
+
+
             # 顯示數據統計(改為表格形式)- 根據頻率範圍過濾
             st.subheader("📊 Data Statistics")
             
