@@ -31,3 +31,8 @@ Thumbs.db
 *.s3p
 *.s4p
 *.snp
+
+# Local / scratch
+.claude/
+bak/
+test/

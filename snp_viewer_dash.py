@@ -1,0 +1,1932 @@
+"""
+SNP Viewer - Dash 版本
+完整移植自 Streamlit 版，功能對等：
+- 多檔案上傳與疊圖
+- S-parameter 選擇 (S11/S21/S12/S22...)
+- 資料類型選擇 (Magnitude / Phase / Smith Chart)
+- 頻率範圍篩選
+- Amplitude 範圍控制
+- Marker (垂直/水平/十字) + 自訂樣式
+- Threshold Marker + 交叉點計算
+- 檔案顯示/隱藏勾選
+- 統計表格 / Marker 數值表 / 原始資料表
+- 線條寬度控制
+"""
+
+import base64
+import io
+import json
+import os
+import tempfile
+import warnings
+
+import numpy as np
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import skrf as rf
+from dash import (
+    ALL,
+    Dash,
+    Input,
+    Output,
+    State,
+    callback,
+    ctx,
+    dash_table,
+    dcc,
+    html,
+    no_update,
+)
+from dash.exceptions import PreventUpdate
+
+warnings.filterwarnings("ignore", message=".*keyword arguments have been deprecated.*")
+
+# ============================================================
+# App 初始化
+# ============================================================
+app = Dash(
+    __name__,
+    title="SNP Viewer",
+    suppress_callback_exceptions=True,  # 動態元件必須設定
+)
+server = app.server  # for deployment (gunicorn)
+
+# ============================================================
+# 常數
+# ============================================================
+DEFAULT_MARKER_COLORS = [
+    "#FF0000", "#00AA00", "#0000FF", "#FF00FF", "#CC8800",
+    "#00CCCC", "#FF6600", "#800080", "#CC0066", "#A52A2A",
+]
+COLOR_PALETTE = px.colors.qualitative.Plotly + px.colors.qualitative.Bold
+
+_COLOR_OPTIONS_MAP = {
+    "#FF0000": "🔴 Red",       "#00AA00": "🟢 Green",
+    "#0000FF": "🔵 Blue",      "#FF00FF": "🟣 Magenta",
+    "#CC8800": "🟠 Orange",    "#00CCCC": "🩵 Cyan",
+    "#FF6600": "🟧 Dk.Orange", "#800080": "🟤 Purple",
+    "#CC0066": "🌸 Pink",      "#A52A2A": "🟫 Brown",
+    "#000000": "⚫ Black",     "#888888": "⬜ Gray",
+}
+COLOR_DROPDOWN_OPTIONS = [{"label": v, "value": k} for k, v in _COLOR_OPTIONS_MAP.items()]
+
+def color_dropdown(component_id, default_index: int = 0):
+    return dcc.Dropdown(
+        id=component_id,
+        options=COLOR_DROPDOWN_OPTIONS,
+        value=DEFAULT_MARKER_COLORS[default_index % len(DEFAULT_MARKER_COLORS)],
+        clearable=False,
+        style={"fontSize": "12px"},
+    )
+
+
+# ============================================================
+# 純計算函數（與 Streamlit 版完全相同，直接搬移）
+# ============================================================
+
+def parse_sparameter_file(filename: str, file_content: str) -> pd.DataFrame:
+    """解析 Touchstone 檔案，回傳含 mag/phase/real/imag 欄位的 DataFrame"""
+    suffix = os.path.splitext(filename)[1]
+    with tempfile.NamedTemporaryFile(mode="w", suffix=suffix, delete=False) as tmp:
+        tmp.write(file_content)
+        tmp_path = tmp.name
+    try:
+        network = rf.Network(tmp_path)
+    finally:
+        os.remove(tmp_path)
+
+    freq = network.frequency.f
+    n_ports = network.number_of_ports
+    data: dict = {"Frequency": freq}
+    for i in range(n_ports):
+        for j in range(n_ports):
+            s = network.s[:, i, j]
+            name = f"S{i+1}{j+1}"
+            data[f"{name}_mag"]   = 20 * np.log10(np.abs(s) + 1e-12)
+            data[f"{name}_phase"] = np.angle(s, deg=True)
+            data[f"{name}_real"]  = np.real(s)
+            data[f"{name}_imag"]  = np.imag(s)
+    return pd.DataFrame(data)
+
+
+def get_available_parameters(df: pd.DataFrame) -> list[str]:
+    param_types: set[str] = set()
+    for col in df.columns:
+        if col != "Frequency" and "_" in col:
+            param_types.add(col.split("_")[0])
+    return sorted(param_types)
+
+
+def get_data_types(df: pd.DataFrame, param_type: str) -> list[str]:
+    data_types: set[str] = set()
+    for col in df.columns:
+        if col.startswith(param_type + "_"):
+            dt = col.split("_")[1]
+            if dt not in ("real", "imag"):
+                data_types.add(dt)
+    if f"{param_type}_real" in df.columns and f"{param_type}_imag" in df.columns:
+        data_types.add("smith")
+    return sorted(data_types)
+
+
+def auto_convert_frequency(df: pd.DataFrame, return_unit_factor=False):
+    freq = df["Frequency"].copy()
+    max_f = freq.max()
+    if max_f >= 1e9:
+        factor, unit = 1e9, "GHz"
+    elif max_f >= 1e6:
+        factor, unit = 1e6, "MHz"
+    elif max_f >= 1e3:
+        factor, unit = 1e3, "kHz"
+    else:
+        factor, unit = 1, "Hz"
+    df2 = df.copy()
+    df2["Frequency"] = freq / factor
+    if return_unit_factor:
+        return df2, unit, factor
+    return df2, unit
+
+
+def get_display_name(filename: str) -> str:
+    return os.path.splitext(filename)[0]
+
+
+def get_y_axis_unit(data_type: str) -> str:
+    if "mag" in data_type.lower():
+        return "dB"
+    if "phase" in data_type.lower():
+        return "deg"
+    return ""
+
+
+def filter_by_frequency_range(df: pd.DataFrame, fmin: float, fmax: float) -> pd.DataFrame:
+    mask = (df["Frequency"] >= fmin) & (df["Frequency"] <= fmax)
+    return df[mask].copy()
+
+
+def find_nearest_value(df: pd.DataFrame, freq_target: float, col: str):
+    idx = (df["Frequency"] - freq_target).abs().idxmin()
+    return df.loc[idx, "Frequency"], df.loc[idx, col]
+
+
+def find_threshold_crossings(df: pd.DataFrame, col: str, threshold: float) -> list[float]:
+    freqs  = df["Frequency"].values
+    values = df[col].values
+    crossings = []
+    for i in range(len(values) - 1):
+        v0 = values[i] - threshold
+        v1 = values[i + 1] - threshold
+        if v0 * v1 <= 0 and v0 != v1:
+            t = -v0 / (v1 - v0)
+            crossings.append(float(freqs[i] + t * (freqs[i + 1] - freqs[i])))
+    return crossings
+
+
+# ============================================================
+# 圖表建構（邏輯與 Streamlit 版相同）
+# ============================================================
+
+def build_base_figure(
+    files_data: dict,
+    visible_filenames: list[str],
+    selected_param: str,
+    selected_data_type: str,
+    freq_range: tuple,
+    amp_range: tuple,
+    threshold_markers_list: list,
+    line_width: int,
+    num_markers: int = 0,
+) -> tuple[go.Figure, dict, int, dict]:
+    """
+    只畫主曲線 + threshold，不畫 marker overlay。
+    回傳 (fig, threshold_crossings, base_trace_count, threshold_shape_map)
+    threshold_shape_map = { str(shape_index): threshold_id_str }
+    """
+    selected_param_full = f"{selected_param}_{selected_data_type}"
+    y_axis_unit = get_y_axis_unit(selected_data_type)
+    is_smith = selected_data_type == "smith"
+
+    visible_files = {k: files_data[k] for k in visible_filenames if k in files_data}
+
+    if visible_files:
+        first_df = list(visible_files.values())[0]["df"]
+        _, freq_unit, _ = auto_convert_frequency(first_df, return_unit_factor=True)
+    else:
+        freq_unit = "GHz"
+
+    fig = go.Figure()
+    threshold_crossings: dict = {}
+
+    # ── 主線 ──────────────────────────────────────────────
+    for idx, (filename, file_info) in enumerate(visible_files.items()):
+        df = file_info["df"]
+        df_conv, _ = auto_convert_frequency(df)
+        df_filt = filter_by_frequency_range(df_conv, freq_range[0], freq_range[1])
+        display_name = get_display_name(filename)
+        color = COLOR_PALETTE[idx % len(COLOR_PALETTE)]
+
+        if is_smith:
+            if f"{selected_param}_real" not in df_filt.columns:
+                continue
+            gamma = (df_filt[f"{selected_param}_real"].values
+                     + 1j * df_filt[f"{selected_param}_imag"].values)
+            z_norm = (1 + gamma) / (1 - gamma + 1e-30)
+            fig.add_trace(go.Scattersmith(
+                real=np.real(z_norm).tolist(),
+                imag=np.imag(z_norm).tolist(),
+                customdata=df_filt["Frequency"].tolist(),
+                mode="lines",
+                name=display_name,
+                line=dict(color=color, width=line_width),
+                hovertemplate=(
+                    f"<b>{display_name}</b><br>"
+                    f"Freq: %{{customdata:.3f}} {freq_unit}<br>"
+                    "<extra></extra>"
+                ),
+            ))
+        else:
+            if selected_param_full not in df_filt.columns:
+                continue
+            show_line_legend = (num_markers == 0)
+            fig.add_trace(go.Scatter(
+                x=df_filt["Frequency"],
+                y=df_filt[selected_param_full],
+                mode="lines",
+                name=display_name,
+                line=dict(color=color, width=line_width),
+                marker=dict(size=4),
+                showlegend=show_line_legend,
+                hovertemplate=(
+                    f"<b>{display_name}</b><br>"
+                    f"Frequency: %{{x:.3f}} {freq_unit}<br>"
+                    f"{selected_param_full}: %{{y:.3f}} {y_axis_unit}<br>"
+                    "<extra></extra>"
+                ),
+            ))
+
+    # ── Threshold Markers ─────────────────────────────────
+    threshold_shape_map: dict = {}   # shape_index → threshold id str
+    if not is_smith:
+        for t_idx, marker in enumerate(threshold_markers_list):
+            t_val   = marker["value"]
+            t_label = marker["label"]
+            t_color = marker["color"]
+            t_show  = marker.get("show_in_legend", True)
+            t_id_str = marker.get("id_str", str(t_idx + 1))
+            threshold_crossings[t_label] = {}
+
+            # 記錄此 threshold 對應的 shape index（fig.layout.shapes 目前長度）
+            shape_idx = len(fig.layout.shapes)
+            threshold_shape_map[str(shape_idx)] = t_id_str
+
+            # 水平線 shape，加上 editable=True 讓使用者可拖動
+            fig.add_shape(
+                type="line",
+                x0=0, x1=1,
+                y0=t_val, y1=t_val,
+                xref="paper", yref="y",
+                line=dict(color=t_color, dash="dash", width=2),
+                opacity=0.8,
+                editable=True,
+            )
+            # 標籤固定在圖框右端，水平顯示
+            fig.add_annotation(
+                x=0,
+                y=t_val,
+                xref="paper",
+                yref="y",
+                text=t_label,
+                showarrow=False,
+                xanchor="left",
+                yanchor="bottom",
+                xshift=6,
+                yshift=4,
+                font=dict(size=10, color=t_color),
+                bgcolor="rgba(255,255,255,0.8)",
+                bordercolor=t_color,
+                borderwidth=1,
+                borderpad=3,
+            )
+
+            for idx, (filename, file_info) in enumerate(visible_files.items()):
+                df_conv, _ = auto_convert_frequency(file_info["df"])
+                if selected_param_full not in df_conv.columns:
+                    continue
+                crossings = find_threshold_crossings(df_conv, selected_param_full, t_val)
+                display_name = get_display_name(filename)
+                threshold_crossings[t_label][display_name] = crossings
+                line_color = COLOR_PALETTE[idx % len(COLOR_PALETTE)]
+                for c_freq in crossings:
+                    legend_text = f"{display_name} ✕ {t_label}: {c_freq:.3f} {freq_unit}"
+                    fig.add_trace(go.Scatter(
+                        x=[c_freq], y=[t_val],
+                        mode="markers",
+                        marker=dict(
+                            size=12, color=line_color, symbol="x",
+                            line=dict(width=2, color=t_color),
+                        ),
+                        name=legend_text,
+                        legendgroup=f"threshold_{t_label}",
+                        showlegend=t_show,
+                        hovertemplate=(
+                            f"<b>{t_label}</b><br>{display_name}<br>"
+                            f"Frequency: {c_freq:.3f} {freq_unit}<br>"
+                            f"Threshold: {t_val:.1f} {y_axis_unit}<br>"
+                            "<extra></extra>"
+                        ),
+                    ))
+
+    base_trace_count = len(fig.data)
+
+    # ── Layout ────────────────────────────────────────────
+    legend_style = dict(
+        bgcolor="rgba(255,255,255,0.9)",
+        bordercolor="rgba(200,200,200,0.5)",
+        borderwidth=1,
+        orientation="v",
+        yanchor="top", y=1,
+        xanchor="left", x=1.02,
+        itemsizing="constant",
+        tracegroupgap=0,
+    )
+
+    if is_smith:
+        fig.update_layout(
+            title=f"{selected_param} Smith Chart",
+            height=600,
+            showlegend=True,
+            legend=legend_style,
+            margin=dict(t=80, b=80, l=80, r=150),
+        )
+    else:
+        y_title = f"{selected_param_full} ({y_axis_unit})" if y_axis_unit else selected_param_full
+        y_min = amp_range[0]
+        y_max = amp_range[1]
+        if threshold_markers_list:
+            y_min = min(y_min, min(m["value"] for m in threshold_markers_list))
+            y_max = max(y_max, max(m["value"] for m in threshold_markers_list))
+
+        fig.update_layout(
+            title=selected_param_full,
+            xaxis_title=f"Freq ({freq_unit})",
+            yaxis_title=y_title,
+            plot_bgcolor="rgba(240,240,240,0.5)",
+            height=600,
+            showlegend=True,
+            legend=legend_style,
+            margin=dict(t=80, b=80, l=80, r=150),
+            xaxis=dict(showgrid=True, gridcolor="rgba(200,200,200,0.3)", gridwidth=1),
+            yaxis=dict(
+                showgrid=True,
+                gridcolor="rgba(200,200,200,0.3)",
+                gridwidth=1,
+                range=[y_min, y_max],
+            ),
+        )
+
+    return fig, threshold_crossings, base_trace_count, threshold_shape_map
+
+
+def compute_marker_overlay(
+    files_data: dict,
+    visible_filenames: list[str],
+    selected_param: str,
+    selected_data_type: str,
+    markers_list: list,
+) -> tuple[list, list, list, dict, dict]:
+    """
+    計算 marker 讀值 trace、shape 和 annotation，不需要重畫曲線。
+    回傳 (overlay_traces, shapes, annotations, marker_values, shape_index_map)
+    """
+    selected_param_full = f"{selected_param}_{selected_data_type}"
+    y_axis_unit = get_y_axis_unit(selected_data_type)
+    is_smith = selected_data_type == "smith"
+
+    visible_files = {k: files_data[k] for k in visible_filenames if k in files_data}
+
+    if visible_files:
+        first_df = list(visible_files.values())[0]["df"]
+        _, freq_unit, _ = auto_convert_frequency(first_df, return_unit_factor=True)
+    else:
+        freq_unit = "GHz"
+
+    overlay_traces = []
+    shapes         = []
+    annotations    = []
+    marker_values: dict     = {}
+    shape_index_map: dict   = {}
+
+    if is_smith or not markers_list:
+        return overlay_traces, shapes, annotations, marker_values, shape_index_map
+
+    for marker_idx, marker in enumerate(markers_list):
+        m_freq  = marker["freq"]
+        m_label = marker["label"]
+        m_color = marker["color"]
+        m_show  = marker.get("show_in_legend", True)
+
+        marker_values[m_label] = []
+
+        shape_index_map[len(shapes)] = marker_idx
+        shapes.append(dict(
+            type="line",
+            x0=m_freq, x1=m_freq,
+            y0=0, y1=1,
+            xref="x", yref="paper",
+            line=dict(color=m_color, dash="dash", width=2),
+            opacity=0.8,
+            editable=True,
+        ))
+
+        # 標籤固定在圖框頂端，水平顯示，不隨線旋轉
+        annotations.append(dict(
+            x=m_freq,
+            y=1,
+            xref="x",
+            yref="paper",
+            text=m_label,
+            showarrow=False,
+            xanchor="center",
+            yanchor="bottom",
+            yshift=4,
+            font=dict(size=10, color=m_color),
+            bgcolor="rgba(255,255,255,0.8)",
+            bordercolor=m_color,
+            borderwidth=1,
+            borderpad=3,
+        ))
+
+        for idx, (filename, file_info) in enumerate(visible_files.items()):
+            df_conv, _ = auto_convert_frequency(file_info["df"])
+            if selected_param_full not in df_conv.columns:
+                continue
+            actual_freq, actual_val = find_nearest_value(df_conv, m_freq, selected_param_full)
+            display_name = get_display_name(filename)
+            marker_values[m_label].append((display_name, actual_freq, actual_val))
+            line_color = COLOR_PALETTE[idx % len(COLOR_PALETTE)]
+            legend_text = f"{display_name} @ {m_label} {freq_unit}: {actual_val:.3f} {y_axis_unit}"
+            x_coords = [actual_freq - 0.001, actual_freq, actual_freq + 0.001]
+            y_coords = [actual_val] * 3
+            overlay_traces.append(go.Scatter(
+                x=x_coords, y=y_coords,
+                mode="lines+markers",
+                line=dict(color=m_color, width=2, dash="dash"),
+                marker=dict(
+                    size=[0, 12, 0],
+                    color=line_color,
+                    symbol="diamond",
+                    line=dict(width=2, color="white"),
+                ),
+                name=legend_text,
+                legendgroup=f"marker_{m_label}",
+                showlegend=m_show,
+                hovertemplate=(
+                    f"<b>{m_label}</b><br>{display_name}<br>"
+                    f"Frequency: {actual_freq:.3f} {freq_unit}<br>"
+                    f"Value: {actual_val:.3f} {y_axis_unit}<br>"
+                    "<extra></extra>"
+                ),
+            ))
+
+    return overlay_traces, shapes, annotations, marker_values, shape_index_map
+
+
+# 保留舊名稱作為 wrapper，方便測試相容
+def build_figure(
+    files_data, visible_filenames, selected_param, selected_data_type,
+    freq_range, amp_range, markers_list, threshold_markers_list, line_width,
+):
+    fig, threshold_crossings, base_trace_count, threshold_shape_map = build_base_figure(
+        files_data, visible_filenames, selected_param, selected_data_type,
+        freq_range, amp_range, threshold_markers_list, line_width,
+        num_markers=len(markers_list),
+    )
+    overlay_traces, shapes, annotations, marker_values, shape_index_map = compute_marker_overlay(
+        files_data, visible_filenames, selected_param, selected_data_type, markers_list,
+    )
+    for trace in overlay_traces:
+        fig.add_trace(trace)
+    for shape in shapes:
+        fig.add_shape(**shape)
+    for ann in annotations:
+        fig.add_annotation(**ann)
+    return fig, marker_values, threshold_crossings, shape_index_map
+
+
+# ============================================================
+# 統計 / Marker / Threshold 表格
+# ============================================================
+
+def build_stats_table(files_data, visible_filenames, selected_param_full, freq_range):
+    rows = []
+    for fname in visible_filenames:
+        if fname not in files_data:
+            continue
+        df_conv, _ = auto_convert_frequency(files_data[fname]["df"])
+        df_filt = filter_by_frequency_range(df_conv, freq_range[0], freq_range[1])
+        if selected_param_full not in df_filt.columns:
+            continue
+        data = df_filt[selected_param_full]
+        rows.append({
+            "File Name": get_display_name(fname),
+            "Max":        f"{data.max():.3f}",
+            "Min":        f"{data.min():.3f}",
+            "Mean":       f"{data.mean():.3f}",
+            "Range":      f"{(data.max() - data.min()):.3f}",
+            "Data Points": len(data),
+        })
+    return pd.DataFrame(rows)
+
+
+def build_marker_table(marker_values, visible_filenames, freq_unit, y_axis_unit):
+    table: dict = {}
+    for fname in visible_filenames:
+        dn = get_display_name(fname)
+        table[dn] = {"File": dn}
+    for m_label, values in marker_values.items():
+        col = f"Value @ {m_label} {freq_unit} ({y_axis_unit})"
+        for dn, actual_freq, actual_val in values:
+            if dn in table:
+                table[dn][col] = f"{actual_val:.3f}"
+    return pd.DataFrame(list(table.values())).set_index("File").reset_index()
+
+
+def build_threshold_table(threshold_crossings, visible_filenames, freq_unit):
+    table: dict = {}
+    for fname in visible_filenames:
+        dn = get_display_name(fname)
+        table[dn] = {"File": dn}
+    for t_label, file_crossings in threshold_crossings.items():
+        col = f"Crossing Freq @ {t_label} ({freq_unit})"
+        for dn, crossings in file_crossings.items():
+            if dn in table:
+                table[dn][col] = (", ".join(f"{f:.3f}" for f in crossings) if crossings else "—")
+    return pd.DataFrame(list(table.values())).set_index("File").reset_index()
+
+
+# ============================================================
+# Dash Table helper
+# ============================================================
+
+def df_to_dash_table(df: pd.DataFrame, table_id: str):
+    return dash_table.DataTable(
+        id=table_id,
+        columns=[{"name": c, "id": c} for c in df.columns],
+        data=df.to_dict("records"),
+        style_table={"overflowX": "auto"},
+        style_cell={"textAlign": "left", "padding": "6px 10px", "fontSize": "13px"},
+        style_header={"fontWeight": "bold", "backgroundColor": "#f0f0f0"},
+        style_data_conditional=[
+            {"if": {"row_index": "odd"}, "backgroundColor": "#fafafa"}
+        ],
+    )
+
+
+# ============================================================
+# Layout
+# ============================================================
+
+SIDEBAR_STYLE = {
+    "width": "300px",
+    "minWidth": "300px",
+    "padding": "16px",
+    "backgroundColor": "#f8f9fa",
+    "borderRight": "1px solid #dee2e6",
+    "overflowY": "auto",
+    "height": "100vh",
+    "position": "sticky",
+    "top": 0,
+    "transition": "width 0.2s ease, min-width 0.2s ease, padding 0.2s ease",
+}
+
+SIDEBAR_COLLAPSED_STYLE = {
+    "width": "0",
+    "minWidth": "0",
+    "padding": "0",
+    "backgroundColor": "#f8f9fa",
+    "borderRight": "none",
+    "overflow": "hidden",
+    "height": "100vh",
+    "position": "sticky",
+    "top": 0,
+    "transition": "width 0.2s ease, min-width 0.2s ease, padding 0.2s ease",
+}
+
+CONTENT_STYLE = {
+    "flex": "1",
+    "padding": "20px",
+    "overflowY": "auto",
+    "minWidth": 0,
+}
+
+SECTION_STYLE = {
+    "marginBottom": "8px",
+    "fontWeight": "600",
+    "fontSize": "13px",
+    "color": "#495057",
+    "borderBottom": "1px solid #dee2e6",
+    "paddingBottom": "4px",
+    "marginTop": "16px",
+}
+
+INPUT_STYLE = {
+    "width": "100%",
+    "padding": "4px 8px",
+    "border": "1px solid #ced4da",
+    "borderRadius": "4px",
+    "fontSize": "13px",
+}
+
+def label(text):
+    return html.Label(text, style={"fontSize": "12px", "color": "#6c757d", "marginBottom": "2px", "display": "block"})
+
+def section(text):
+    return html.Div(text, style=SECTION_STYLE)
+
+
+app.layout = html.Div([
+    # ── dcc.Store：所有狀態存在 browser session ──────────────
+    dcc.Store(id="store-files-data",      storage_type="memory", data={}),
+    dcc.Store(id="store-freq-meta",       storage_type="memory", data={}),
+    dcc.Store(id="store-markers",         storage_type="memory", data=[]),
+    dcc.Store(id="store-thresholds",      storage_type="memory", data=[]),
+    dcc.Store(id="store-resize-init",     data=1),
+    dcc.Store(id="store-shape-index-map",           storage_type="memory", data={}),
+    dcc.Store(id="store-threshold-shape-map",       storage_type="memory", data={}),
+    dcc.Store(id="store-visible-files",   storage_type="memory", data=[]),
+    dcc.Store(id="store-base-trace-count",       storage_type="memory", data=0),
+    dcc.Store(id="store-threshold-annotations",  storage_type="memory", data=[]),
+    dcc.Store(id="store-upload-queue",           storage_type="memory", data=None),
+    dcc.Store(id="store-setup-done",             data=0),
+    dcc.Interval(id="interval-upload-check", interval=300, n_intervals=0),
+
+    # ── 頁面主體 ──────────────────────────────────────────────
+    html.Div([
+
+        # ════ 側邊欄 ════
+        html.Div([
+            html.H2("⚙️ Settings", style={"fontSize": "16px", "marginBottom": "12px", "marginTop": 0}),
+
+            # 上傳
+            section("📎 Upload Files"),
+            html.Div([
+                html.Div([
+                    "Drag & Drop or ",
+                    html.Span("Browse .snp files", style={"color": "#0d6efd"}),
+                ]),
+            ], id="upload-drop-zone", style={
+                "width": "100%", "boxSizing": "border-box",
+                "border": "2px dashed #ced4da",
+                "borderRadius": "8px", "textAlign": "center",
+                "padding": "16px 8px", "cursor": "pointer",
+                "fontSize": "13px", "backgroundColor": "#fff",
+            }),
+            html.Div(id="uploaded-files-list", style={
+                "marginTop": "8px",
+                "maxHeight": "220px",
+                "overflowY": "auto",
+            }),
+            html.Div(id="upload-error", style={"color": "red", "fontSize": "12px", "marginTop": "4px"}),
+
+            # 選擇 Parameter
+            section("📈 Select Parameters"),
+            label("Parameter Type"),
+            dcc.Dropdown(id="dd-param", clearable=False, style={"fontSize": "13px", "marginBottom": "6px"}),
+            label("Data Type"),
+            dcc.Dropdown(id="dd-datatype", clearable=False, style={"fontSize": "13px"}),
+
+            # 頻率範圍
+            section("🔍 Frequency Range"),
+            html.Div([
+                html.Div([
+                    label("Min"),
+                    dcc.Input(id="freq-min", type="number", debounce=True, style=INPUT_STYLE),
+                ], style={"flex": 1, "marginRight": "6px"}),
+                html.Div([
+                    label("Max"),
+                    dcc.Input(id="freq-max", type="number", debounce=True, style=INPUT_STYLE),
+                ], style={"flex": 1}),
+            ], style={"display": "flex", "marginBottom": "4px"}),
+            html.Div(id="freq-range-caption", style={"fontSize": "11px", "color": "#6c757d"}),
+
+            # Amplitude 範圍
+            html.Div(id="amp-range-section", children=[
+                section("📏 Amplitude Range"),
+                html.Div([
+                    html.Div([
+                        label("Min (dB)"),
+                        dcc.Input(id="amp-min", type="number", debounce=True, style=INPUT_STYLE),
+                    ], style={"flex": 1, "marginRight": "6px"}),
+                    html.Div([
+                        label("Max (dB)"),
+                        dcc.Input(id="amp-max", type="number", debounce=True, style=INPUT_STYLE),
+                    ], style={"flex": 1}),
+                ], style={"display": "flex", "marginBottom": "4px"}),
+                html.Div(id="amp-range-caption", style={"fontSize": "11px", "color": "#6c757d"}),
+            ]),
+
+            # Marker
+            section("📍 Markers"),
+            dcc.Store(id="num-markers", data={}),
+            html.Div([
+                html.Button("−", id="btn-marker-dec", n_clicks=0, style={
+                    "width": "28px", "height": "28px", "border": "1px solid #ced4da",
+                    "borderRadius": "4px", "backgroundColor": "#fff", "cursor": "pointer",
+                    "fontSize": "16px", "lineHeight": "1", "padding": "0", "fontWeight": "500"}),
+                html.Span("0", id="num-markers-display", style={
+                    "minWidth": "28px", "textAlign": "center",
+                    "fontSize": "15px", "fontWeight": "500", "color": "#212529"}),
+                html.Button("+", id="btn-marker-inc", n_clicks=0, style={
+                    "width": "28px", "height": "28px", "border": "1px solid #ced4da",
+                    "borderRadius": "4px", "backgroundColor": "#fff", "cursor": "pointer",
+                    "fontSize": "16px", "lineHeight": "1", "padding": "0", "fontWeight": "500"}),
+            ], style={"display": "flex", "alignItems": "center", "gap": "8px", "marginBottom": "8px"}),
+            html.Div(id="markers-container"),
+
+            # Threshold Marker
+            section("📐 Threshold Markers"),
+            dcc.Store(id="num-thresholds", data={}),
+            html.Div([
+                html.Button("−", id="btn-threshold-dec", n_clicks=0, style={
+                    "width": "28px", "height": "28px", "border": "1px solid #ced4da",
+                    "borderRadius": "4px", "backgroundColor": "#fff", "cursor": "pointer",
+                    "fontSize": "16px", "lineHeight": "1", "padding": "0", "fontWeight": "500"}),
+                html.Span("0", id="num-thresholds-display", style={
+                    "minWidth": "28px", "textAlign": "center",
+                    "fontSize": "15px", "fontWeight": "500", "color": "#212529"}),
+                html.Button("+", id="btn-threshold-inc", n_clicks=0, style={
+                    "width": "28px", "height": "28px", "border": "1px solid #ced4da",
+                    "borderRadius": "4px", "backgroundColor": "#fff", "cursor": "pointer",
+                    "fontSize": "16px", "lineHeight": "1", "padding": "0", "fontWeight": "500"}),
+            ], style={"display": "flex", "alignItems": "center", "gap": "8px", "marginBottom": "8px"}),
+            html.Div(id="thresholds-container"),
+
+            # 檔案顯示切換
+            section("📋 Select Files"),
+            html.Div("No files loaded", id="no-files-hint",
+                     style={"fontSize": "12px", "color": "#aaa"}),
+            dcc.Checklist(
+                id="file-checklist",
+                options=[],
+                value=[],
+                style={"display": "none"},
+                inputStyle={"marginRight": "6px"},
+                labelStyle={"display": "block", "marginBottom": "4px"},
+            ),
+
+            # 線條寬度
+            section("🖊 Line Width"),
+            dcc.Slider(id="line-width", min=1, max=5, step=1, value=2,
+                       marks={i: str(i) for i in range(1, 6)},
+                       tooltip={"placement": "bottom"}),
+
+            # 清除快取
+            html.Hr(style={"margin": "16px 0"}),
+            html.Button("🗑️ Clear All Files", id="btn-clear", n_clicks=0,
+                        style={"width": "100%", "padding": "6px", "cursor": "pointer",
+                               "backgroundColor": "#fff0f0", "border": "1px solid #f5c6cb",
+                               "borderRadius": "4px", "fontSize": "13px"}),
+            html.Div(id="cache-status", style={"fontSize": "11px", "color": "#6c757d", "marginTop": "4px"}),
+
+        ], id="sidebar", style=SIDEBAR_STYLE),
+
+        # ════ 拖曳把手 + 折疊鈕 ════
+        html.Div(
+            html.Button("◀", id="btn-sidebar-toggle", n_clicks=0,
+                        title="拖曳調整寬度 / 點擊收合",
+                        style={
+                            "position": "absolute", "top": "16px",
+                            "left": "50%", "transform": "translateX(-50%)",
+                            "cursor": "pointer",
+                            "border": "1px solid #dee2e6",
+                            "background": "white",
+                            "borderRadius": "0 4px 4px 0",
+                            "width": "14px", "height": "40px",
+                            "fontSize": "9px", "padding": "0",
+                            "lineHeight": "40px", "textAlign": "center",
+                            "boxShadow": "1px 0 4px rgba(0,0,0,0.08)",
+                            "userSelect": "none",
+                        }),
+            id="sidebar-gutter",
+            style={
+                "width": "14px", "flexShrink": "0",
+                "position": "relative",
+                "backgroundColor": "#f8f9fa",
+                "borderLeft": "1px solid #dee2e6",
+                "cursor": "col-resize",
+                "userSelect": "none",
+                "zIndex": "5",
+            },
+        ),
+
+        # ════ 主內容區 ════
+        html.Div([
+            html.H1("📊 S-parameter Viewer", style={"fontSize": "22px", "marginBottom": "4px", "marginTop": 0}),
+            html.P("Upload multiple .snp files (.s1p, .s2p, .s4p, etc.) for plotting comparison and analysis",
+                   style={"color": "#6c757d", "fontSize": "14px", "marginBottom": "16px"}),
+
+            html.Div(id="main-content", children=[
+                html.Div("👈 Please upload .snp files from the left sidebar to start",
+                         style={"padding": "40px", "textAlign": "center", "color": "#6c757d",
+                                "backgroundColor": "#f8f9fa", "borderRadius": "8px",
+                                "border": "2px dashed #dee2e6"})
+            ]),
+
+            html.Hr(style={"margin": "24px 0"}),
+            html.P("💡 Tip: Upload .snp files, select parameters, and use markers for precise frequency analysis.",
+                   style={"color": "#6c757d", "fontSize": "12px"}),
+        ], style=CONTENT_STYLE),
+
+    ], style={"display": "flex", "height": "100vh", "overflow": "hidden"}),
+
+], style={"fontFamily": "system-ui, -apple-system, sans-serif"})
+
+
+# ============================================================
+# Callbacks
+# ============================================================
+
+# ── 1. 上傳檔案 → 更新 Store ─────────────────────────────
+@callback(
+    Output("store-files-data", "data"),
+    Output("store-freq-meta", "data"),
+    Output("upload-error", "children"),
+    Output("cache-status", "children"),
+    Input("store-upload-queue", "data"),
+    State("store-files-data", "data"),
+    prevent_initial_call=True,
+)
+def handle_upload(queue_data, existing_data):
+    if not queue_data:
+        raise PreventUpdate
+
+    contents_list = queue_data.get("contents", [])
+    filenames     = queue_data.get("filenames", [])
+    sizes         = queue_data.get("sizes", [])
+
+    if not contents_list:
+        raise PreventUpdate
+
+    existing_data = existing_data or {}
+    errors = []
+
+    for i, (content, filename) in enumerate(zip(contents_list, filenames)):
+        if filename in existing_data:
+            continue
+        try:
+            _, b64 = content.split(",", 1)
+            file_bytes = base64.b64decode(b64)
+            size_kb = sizes[i] if i < len(sizes) else round(len(file_bytes) / 1024, 1)
+            try:
+                file_str = file_bytes.decode("utf-8")
+            except UnicodeDecodeError:
+                file_str = file_bytes.decode("latin-1")
+            df = parse_sparameter_file(filename, file_str)
+            existing_data[filename] = {
+                "df_json": df.to_json(orient="split"),
+                "size_kb": size_kb,
+            }
+        except Exception as e:
+            errors.append(f"❌ {filename}: {str(e)}")
+
+    # 計算頻率 meta（以第一個檔案為準）
+    freq_meta = {}
+    if existing_data:
+        first_df = pd.read_json(io.StringIO(list(existing_data.values())[0]["df_json"]), orient="split")
+        _, unit, factor = auto_convert_frequency(first_df, return_unit_factor=True)
+        all_mins = []
+        all_maxs = []
+        for fdata in existing_data.values():
+            df = pd.read_json(io.StringIO(fdata["df_json"]), orient="split")
+            all_mins.append(df["Frequency"].min())
+            all_maxs.append(df["Frequency"].max())
+        freq_meta = {
+            "unit": unit,
+            "factor": factor,
+            "raw_min": min(all_mins),
+            "raw_max": max(all_maxs),
+            "disp_min": min(all_mins) / factor,
+            "disp_max": max(all_maxs) / factor,
+        }
+
+    error_msg = " | ".join(errors) if errors else ""
+    status = f"📦 {len(existing_data)} file(s) loaded"
+    return existing_data, freq_meta, error_msg, status
+
+
+# ── 2. 清除全部 ──────────────────────────────────────────
+@callback(
+    Output("store-files-data", "data", allow_duplicate=True),
+    Output("store-freq-meta", "data", allow_duplicate=True),
+    Output("cache-status", "children", allow_duplicate=True),
+    Input("btn-clear", "n_clicks"),
+    prevent_initial_call=True,
+)
+def clear_files(n):
+    if not n:
+        raise PreventUpdate
+    return {}, {}, "📦 0 file(s) loaded"
+
+
+# ── 2b. 顯示已上傳檔案卡片 ───────────────────────────────
+@callback(
+    Output("uploaded-files-list", "children"),
+    Input("store-files-data", "data"),
+)
+def render_uploaded_files_list(files_data):
+    if not files_data:
+        return []
+    cards = []
+    for filename, fdata in files_data.items():
+        size_kb = fdata.get("size_kb", "?")
+        cards.append(
+            html.Div([
+                html.Div("📄", style={
+                    "width": "36px", "height": "36px",
+                    "backgroundColor": "#1e293b",
+                    "borderRadius": "6px",
+                    "display": "flex", "alignItems": "center",
+                    "justifyContent": "center",
+                    "fontSize": "16px", "flexShrink": "0",
+                }),
+                html.Div([
+                    html.Div(filename, style={
+                        "fontSize": "12px", "fontWeight": "500",
+                        "color": "#212529", "wordBreak": "break-all",
+                        "lineHeight": "1.3",
+                    }),
+                    html.Div(f"{size_kb} KB", style={
+                        "fontSize": "11px", "color": "#6c757d", "marginTop": "1px",
+                    }),
+                ], style={"flex": "1", "minWidth": "0", "marginLeft": "8px"}),
+                html.Button(
+                    "×",
+                    id={"type": "file-del-btn", "index": filename},
+                    n_clicks=0,
+                    title=f"Remove {filename}",
+                    style={
+                        "width": "20px", "height": "20px",
+                        "border": "1px solid #dee2e6", "borderRadius": "50%",
+                        "backgroundColor": "#f8f9fa", "color": "#6c757d",
+                        "cursor": "pointer", "fontSize": "14px", "lineHeight": "1",
+                        "padding": "0", "fontWeight": "700", "flexShrink": "0",
+                        "display": "inline-flex", "alignItems": "center",
+                        "justifyContent": "center",
+                    },
+                ),
+            ], style={
+                "display": "flex", "alignItems": "center",
+                "padding": "8px 10px",
+                "backgroundColor": "#fff",
+                "border": "1px solid #e9ecef",
+                "borderRadius": "8px",
+                "marginBottom": "6px",
+            })
+        )
+    return cards
+
+
+# ── 2c. 單檔刪除 ──────────────────────────────────────────
+@callback(
+    Output("store-files-data", "data", allow_duplicate=True),
+    Output("store-freq-meta", "data", allow_duplicate=True),
+    Output("cache-status", "children", allow_duplicate=True),
+    Input({"type": "file-del-btn", "index": ALL}, "n_clicks"),
+    State("store-files-data", "data"),
+    prevent_initial_call=True,
+)
+def delete_single_file(del_clicks, files_data):
+    if not any(del_clicks):
+        raise PreventUpdate
+    tid = ctx.triggered_id
+    if not isinstance(tid, dict) or tid.get("type") != "file-del-btn":
+        raise PreventUpdate
+
+    files_data = dict(files_data or {})
+    files_data.pop(tid["index"], None)
+
+    freq_meta = {}
+    if files_data:
+        first_df = pd.read_json(io.StringIO(list(files_data.values())[0]["df_json"]), orient="split")
+        _, unit, factor = auto_convert_frequency(first_df, return_unit_factor=True)
+        all_mins, all_maxs = [], []
+        for fdata in files_data.values():
+            df = pd.read_json(io.StringIO(fdata["df_json"]), orient="split")
+            all_mins.append(df["Frequency"].min())
+            all_maxs.append(df["Frequency"].max())
+        freq_meta = {
+            "unit": unit, "factor": factor,
+            "raw_min": min(all_mins), "raw_max": max(all_maxs),
+            "disp_min": min(all_mins) / factor,
+            "disp_max": max(all_maxs) / factor,
+        }
+
+    return files_data, freq_meta, f"📦 {len(files_data)} file(s) loaded"
+
+
+# ── 3. 更新 Parameter Dropdown ───────────────────────────
+@callback(
+    Output("dd-param", "options"),
+    Output("dd-param", "value"),
+    Input("store-files-data", "data"),
+)
+def update_param_dropdown(files_data):
+    if not files_data:
+        return [], None
+    first_df = pd.read_json(io.StringIO(list(files_data.values())[0]["df_json"]), orient="split")
+    params = get_available_parameters(first_df)
+    default = "S21" if "S21" in params else (params[0] if params else None)
+    return params, default
+
+
+# ── 4. 更新 DataType Dropdown ────────────────────────────
+@callback(
+    Output("dd-datatype", "options"),
+    Output("dd-datatype", "value"),
+    Input("dd-param", "value"),
+    State("store-files-data", "data"),
+)
+def update_datatype_dropdown(param, files_data):
+    if not param or not files_data:
+        return [], None
+    first_df = pd.read_json(io.StringIO(list(files_data.values())[0]["df_json"]), orient="split")
+    dtypes = get_data_types(first_df, param)
+    return dtypes, (dtypes[0] if dtypes else None)
+
+
+# ── 5. 初始化頻率範圍輸入 ────────────────────────────────
+@callback(
+    Output("freq-min", "value"),
+    Output("freq-min", "min"),
+    Output("freq-min", "max"),
+    Output("freq-max", "value"),
+    Output("freq-max", "min"),
+    Output("freq-max", "max"),
+    Output("freq-range-caption", "children"),
+    Input("store-freq-meta", "data"),
+)
+def init_freq_range(meta):
+    if not meta:
+        return [no_update] * 7
+    dmin = meta["disp_min"]
+    dmax = meta["disp_max"]
+    unit = meta["unit"]
+    caption = f"📋 Full range: {dmin:.3f} ~ {dmax:.3f} {unit}"
+    return dmin, dmin, dmax, dmax, dmin, dmax, caption
+
+
+# ── 6. 初始化 Amplitude 範圍（依選擇的 param 自動計算）─
+@callback(
+    Output("amp-min", "value"),
+    Output("amp-max", "value"),
+    Output("amp-range-caption", "children"),
+    Output("amp-range-section", "style"),
+    Input("dd-param", "value"),
+    Input("dd-datatype", "value"),
+    Input("freq-min", "value"),
+    Input("freq-max", "value"),
+    State("store-files-data", "data"),
+    State("store-freq-meta", "data"),
+)
+def update_amp_range(param, data_type, fmin, fmax, files_data, freq_meta):
+    if not param or not data_type or not files_data:
+        return no_update, no_update, no_update, {"display": "none"}
+    is_smith = data_type == "smith"
+    if is_smith:
+        return no_update, no_update, no_update, {"display": "none"}
+
+    selected_param_full = f"{param}_{data_type}"
+    y_unit = get_y_axis_unit(data_type)
+    fmin = fmin or freq_meta.get("disp_min", 0)
+    fmax = fmax or freq_meta.get("disp_max", 1)
+
+    all_vals = []
+    for fdata in files_data.values():
+        df = pd.read_json(io.StringIO(fdata["df_json"]), orient="split")
+        df_conv, _ = auto_convert_frequency(df)
+        df_filt = filter_by_frequency_range(df_conv, fmin, fmax)
+        if selected_param_full in df_filt.columns:
+            all_vals.extend(df_filt[selected_param_full].dropna().tolist())
+
+    if not all_vals:
+        return -100.0, 0.0, "", {"display": "block"}
+
+    data_min, data_max = float(min(all_vals)), float(max(all_vals))
+    pad = (data_max - data_min) * 0.05 if data_max != data_min else 1.0
+    amp_min = round(data_min - pad, 1)
+    amp_max = round(data_max + pad, 1)
+    caption = f"📋 Data range: {data_min:.1f} ~ {data_max:.1f} {y_unit}"
+    return amp_min, amp_max, caption, {"display": "block"}
+
+
+# ── 6b. +/- 按鈕 & 個別刪除按鈕：Marker store (dict) ────
+@callback(
+    Output("num-markers", "data"),
+    Output("num-markers-display", "children"),
+    Input("btn-marker-inc", "n_clicks"),
+    Input("btn-marker-dec", "n_clicks"),
+    Input({"type": "marker-del-btn", "index": ALL}, "n_clicks"),
+    Input({"type": "marker-freq",    "index": ALL}, "value"),   # 使用者改頻率 → 寫回 store
+    State("num-markers", "data"),
+    State("store-freq-meta", "data"),
+    prevent_initial_call=True,
+)
+def update_num_markers(inc, dec, del_clicks, freq_vals, store, freq_meta):
+    # store 格式: { str(id): freq_float }
+    store = dict(store or {})
+    tid = ctx.triggered_id
+    freq_meta = freq_meta or {}
+    dmin = freq_meta.get("disp_min", 0)
+    dmax = freq_meta.get("disp_max", 1)
+    mid_freq = round((dmin + dmax) / 2, 3)
+
+    # 使用者（或拖動 sync）修改了某個 marker 的 freq → 全部同步寫回 store，不增減
+    if isinstance(tid, dict) and tid.get("type") == "marker-freq":
+        for item in ctx.inputs_list[3]:   # marker-freq inputs
+            m_id = str(item["id"]["index"])
+            if m_id in store and item.get("value") is not None:
+                store[m_id] = item["value"]
+        return store, str(len(store))
+
+    if tid == "btn-marker-inc":
+        if len(store) < 10:
+            existing_ids = [int(k) for k in store]
+            next_id = str(max(existing_ids) + 1 if existing_ids else 1)
+            store[next_id] = mid_freq
+    elif tid == "btn-marker-dec":
+        if store:
+            last_key = list(store.keys())[-1]
+            del store[last_key]
+    elif isinstance(tid, dict) and tid.get("type") == "marker-del-btn":
+        del_key = str(tid["index"])
+        store.pop(del_key, None)
+
+    return store, str(len(store))
+
+
+# ── 6c. +/- 按鈕 & 個別刪除：Threshold store (dict) ──────
+@callback(
+    Output("num-thresholds", "data"),
+    Output("num-thresholds-display", "children"),
+    Input("btn-threshold-inc", "n_clicks"),
+    Input("btn-threshold-dec", "n_clicks"),
+    Input({"type": "threshold-del-btn", "index": ALL}, "n_clicks"),
+    Input({"type": "threshold-value",   "index": ALL}, "value"),
+    State("num-thresholds", "data"),
+    State("dd-datatype", "value"),
+    prevent_initial_call=True,
+)
+def update_num_thresholds(inc, dec, del_clicks, t_vals, store, data_type):
+    store = dict(store or {})
+    tid = ctx.triggered_id
+    y_unit = get_y_axis_unit(data_type or "mag")
+    default_val = -30.0
+
+    # 使用者修改了某個 threshold 的值 → 全部同步寫回 store
+    if isinstance(tid, dict) and tid.get("type") == "threshold-value":
+        for item in ctx.inputs_list[3]:
+            t_id = str(item["id"]["index"])
+            if t_id in store and item.get("value") is not None:
+                store[t_id] = item["value"]
+        return store, str(len(store))
+
+    if tid == "btn-threshold-inc":
+        if len(store) < 10:
+            existing_ids = [int(k) for k in store]
+            next_id = str(max(existing_ids) + 1 if existing_ids else 1)
+            store[next_id] = default_val
+    elif tid == "btn-threshold-dec":
+        if store:
+            last_key = list(store.keys())[-1]
+            del store[last_key]
+    elif isinstance(tid, dict) and tid.get("type") == "threshold-del-btn":
+        del_key = str(tid["index"])
+        store.pop(del_key, None)
+
+    return store, str(len(store))
+
+
+# ── 7. 動態產生 Marker 輸入欄位 ─────────────────────────
+@callback(
+    Output("markers-container", "children"),
+    Input("num-markers", "data"),
+    State("store-freq-meta", "data"),
+)
+def render_marker_inputs(store, freq_meta):
+    if not store or not freq_meta:
+        return []
+    unit = freq_meta.get("unit", "GHz")
+    children = []
+    for pos, (m_id_str, freq_val) in enumerate(store.items()):
+        m_id = int(m_id_str)
+        summary = html.Summary(
+            html.Div([
+                html.Span(f"📌 Marker {m_id}",
+                          style={"fontWeight": "500", "fontSize": "13px",
+                                 "flexShrink": "0", "marginRight": "8px"}),
+                dcc.Input(
+                    id={"type": "marker-freq", "index": m_id},
+                    type="number", value=freq_val, debounce=True, step=0.1,
+                    style={"flex": "1", "minWidth": "0", "padding": "2px 4px",
+                           "fontSize": "12px", "border": "1px solid #ced4da",
+                           "borderRadius": "4px", "textAlign": "center"},
+                ),
+                html.Span(f" {unit}", style={"fontSize": "12px", "color": "#6c757d",
+                                             "flexShrink": "0", "marginLeft": "2px"}),
+                html.Button(
+                    "×",
+                    id={"type": "marker-del-btn", "index": m_id},
+                    n_clicks=0,
+                    title=f"Delete Marker {m_id}",
+                    style={
+                        "marginLeft": "6px",
+                        "width": "20px", "height": "20px",
+                        "border": "1px solid #f5c6cb",
+                        "borderRadius": "50%",
+                        "backgroundColor": "#fff0f0",
+                        "color": "#c0392b",
+                        "cursor": "pointer",
+                        "fontSize": "13px",
+                        "lineHeight": "1",
+                        "padding": "0",
+                        "fontWeight": "700",
+                        "display": "inline-flex",
+                        "alignItems": "center",
+                        "justifyContent": "center",
+                        "verticalAlign": "middle",
+                        "flexShrink": "0",
+                    },
+                ),
+            ], style={"display": "flex", "alignItems": "center", "width": "100%"}),
+            style={"cursor": "pointer", "padding": "4px 0"},
+        )
+        body = html.Div([
+            html.Div([
+                html.Div([
+                    label("Color"),
+                    color_dropdown({"type": "marker-color", "index": m_id}, default_index=pos),
+                ], style={"flex": 1, "marginRight": "8px"}),
+                html.Div([
+                    dcc.Checklist(
+                        id={"type": "marker-show-legend", "index": m_id},
+                        options=[{"label": " Show in Legend", "value": "show"}],
+                        value=["show"],
+                        style={"fontSize": "12px", "marginTop": "18px"},
+                    ),
+                ], style={"flex": 1}),
+            ], style={"display": "flex"}),
+        ], style={"padding": "4px 0 4px 8px"})
+        children.append(html.Details(
+            [summary, body], open=(pos == 0),
+            style={"borderBottom": "1px solid #eee", "paddingBottom": "4px", "marginBottom": "2px"},
+        ))
+    return children
+
+
+# ── 8. 動態產生 Threshold 輸入欄位 ─────────────────────
+@callback(
+    Output("thresholds-container", "children"),
+    Input("num-thresholds", "data"),
+    State("dd-datatype", "value"),
+)
+def render_threshold_inputs(store, data_type):
+    if not store:
+        return []
+    y_unit = get_y_axis_unit(data_type or "mag")
+    children = []
+    for pos, (t_id_str, t_val) in enumerate(store.items()):
+        t_id = int(t_id_str)
+        summary = html.Summary(
+            html.Div([
+                html.Span(f"📐 Threshold {t_id}",
+                          style={"fontWeight": "500", "fontSize": "13px",
+                                 "flexShrink": "0", "marginRight": "8px"}),
+                dcc.Input(
+                    id={"type": "threshold-value", "index": t_id},
+                    type="number", value=round(t_val, 2), debounce=True, step=0.5,
+                    style={"flex": "1", "minWidth": "0", "padding": "2px 4px",
+                           "fontSize": "12px", "border": "1px solid #ced4da",
+                           "borderRadius": "4px", "textAlign": "center"},
+                ),
+                html.Span(f" {y_unit}", style={"fontSize": "12px", "color": "#6c757d",
+                                               "flexShrink": "0", "marginLeft": "2px"}),
+                html.Button(
+                    "×",
+                    id={"type": "threshold-del-btn", "index": t_id},
+                    n_clicks=0,
+                    title=f"Delete Threshold {t_id}",
+                    style={
+                        "marginLeft": "6px",
+                        "width": "20px", "height": "20px",
+                        "border": "1px solid #f5c6cb",
+                        "borderRadius": "50%",
+                        "backgroundColor": "#fff0f0",
+                        "color": "#c0392b",
+                        "cursor": "pointer",
+                        "fontSize": "13px",
+                        "lineHeight": "1",
+                        "padding": "0",
+                        "fontWeight": "700",
+                        "display": "inline-flex",
+                        "alignItems": "center",
+                        "justifyContent": "center",
+                        "verticalAlign": "middle",
+                        "flexShrink": "0",
+                    },
+                ),
+            ], style={"display": "flex", "alignItems": "center", "width": "100%"}),
+            style={"cursor": "pointer", "padding": "4px 0"},
+        )
+        body = html.Div([
+            html.Div([
+                html.Div([
+                    label("Color"),
+                    color_dropdown({"type": "threshold-color", "index": t_id}, default_index=pos),
+                ], style={"flex": 1, "marginRight": "8px"}),
+                html.Div([
+                    dcc.Checklist(
+                        id={"type": "threshold-show-legend", "index": t_id},
+                        options=[{"label": " Show in Legend", "value": "show"}],
+                        value=["show"],
+                        style={"fontSize": "12px", "marginTop": "18px"},
+                    ),
+                ], style={"flex": 1}),
+            ], style={"display": "flex"}),
+        ], style={"padding": "4px 0 4px 8px"})
+        children.append(html.Details(
+            [summary, body], open=(pos == 0),
+            style={"borderBottom": "1px solid #eee", "paddingBottom": "4px", "marginBottom": "2px"},
+        ))
+    return children
+
+
+# ── 9. 檔案勾選清單 ──────────────────────────────────────
+_CHECKLIST_VISIBLE_STYLE = {
+    "fontSize": "12px", "maxHeight": "200px", "overflowY": "auto",
+    "border": "1px solid #dee2e6", "borderRadius": "4px", "padding": "8px",
+}
+
+@callback(
+    Output("file-checklist", "options"),
+    Output("file-checklist", "value"),
+    Output("file-checklist", "style"),
+    Output("no-files-hint", "style"),
+    Input("store-files-data", "data"),
+)
+def render_file_checklist(files_data):
+    if not files_data:
+        return [], [], {"display": "none"}, {"fontSize": "12px", "color": "#aaa"}
+    options = [{"label": f" {get_display_name(fn)}", "value": fn} for fn in files_data]
+    return options, list(files_data.keys()), _CHECKLIST_VISIBLE_STYLE, {"display": "none"}
+
+
+# ── 10. 側邊欄折疊 ───────────────────────────────────────
+@callback(
+    Output("sidebar", "style"),
+    Output("btn-sidebar-toggle", "children"),
+    Input("btn-sidebar-toggle", "n_clicks"),
+)
+def toggle_sidebar(n_clicks):
+    if n_clicks and n_clicks % 2 == 1:
+        return SIDEBAR_COLLAPSED_STYLE, "▶"
+    return SIDEBAR_STYLE, "◀"
+
+
+# ── 10b. 拖曳調整側邊欄寬度（clientside）────────────────
+app.clientside_callback(
+    """
+    function(_) {
+        var gutter  = document.getElementById('sidebar-gutter');
+        var sidebar = document.getElementById('sidebar');
+        if (!gutter || !sidebar) return window.dash_clientside.no_update;
+
+        var dragging = false;
+
+        gutter.addEventListener('mousedown', function(e) {
+            if (e.target.id === 'btn-sidebar-toggle') return;
+            dragging = true;
+            e.preventDefault();
+            document.body.style.cursor    = 'col-resize';
+            document.body.style.userSelect = 'none';
+            sidebar.style.transition = 'none';
+        });
+
+        document.addEventListener('mousemove', function(e) {
+            if (!dragging) return;
+            var w = Math.min(Math.max(e.clientX, 150), 600);
+            sidebar.style.width    = w + 'px';
+            sidebar.style.minWidth = w + 'px';
+        });
+
+        document.addEventListener('mouseup', function() {
+            if (!dragging) return;
+            dragging = false;
+            document.body.style.cursor    = '';
+            document.body.style.userSelect = '';
+            sidebar.style.transition = '';
+        });
+
+        return window.dash_clientside.no_update;
+    }
+    """,
+    Output("store-resize-init", "data"),
+    Input("store-resize-init", "data"),
+)
+
+
+# ── 10c. 輪詢 pending upload（每 300ms 檢查一次）────────
+# drop zone 事件綁定已移至 assets/upload_handler.js
+app.clientside_callback(
+    """
+    function(n) {
+        if (!window._pendingUpload) return window.dash_clientside.no_update;
+        var d = window._pendingUpload;
+        window._pendingUpload = null;
+        return d;
+    }
+    """,
+    Output("store-upload-queue", "data"),
+    Input("interval-upload-check", "n_intervals"),
+)
+
+
+# ── 11. 主繪圖 callback（只在「曲線相關」參數變動時觸發）─
+# marker freq/label/color 改成 State，拖動 marker 不再觸發完整重畫
+@callback(
+    Output("main-content", "children"),
+    Output("store-shape-index-map", "data"),
+    Output("store-base-trace-count", "data"),
+    Output("store-threshold-shape-map", "data"),
+    Output("store-threshold-annotations", "data"),
+    # 曲線相關 Input（這些變動才重畫整張圖）
+    Input("store-files-data", "data"),
+    Input("dd-param", "value"),
+    Input("dd-datatype", "value"),
+    Input("freq-min", "value"),
+    Input("freq-max", "value"),
+    Input("amp-min", "value"),
+    Input("amp-max", "value"),
+    Input("line-width", "value"),
+    Input("file-checklist", "value"),
+    # Threshold（變動需重畫）
+    Input({"type": "threshold-value",       "index": ALL}, "value"),
+    Input({"type": "threshold-color",       "index": ALL}, "value"),
+    Input({"type": "threshold-show-legend", "index": ALL}, "value"),
+    # Marker 改成 State（拖動不觸發此 callback）
+    State({"type": "marker-freq",        "index": ALL}, "value"),
+    State({"type": "marker-color",       "index": ALL}, "value"),
+    State({"type": "marker-show-legend", "index": ALL}, "value"),
+    State("num-markers", "data"),
+    State("num-thresholds", "data"),
+    State("store-freq-meta", "data"),
+)
+def update_main(
+    files_data, param, data_type,
+    fmin, fmax, amp_min, amp_max,
+    line_width, visible_filenames,
+    t_values, t_colors, t_shows,
+    m_freqs, m_colors, m_shows,
+    marker_store, threshold_store,
+    freq_meta,
+):
+    if not files_data:
+        return html.Div(
+            "👈 Please upload .snp files from the left sidebar to start",
+            style={"padding": "40px", "textAlign": "center", "color": "#6c757d",
+                   "backgroundColor": "#f8f9fa", "borderRadius": "8px",
+                   "border": "2px dashed #dee2e6"},
+        ), {}, 0, {}, []
+
+    if not param or not data_type:
+        raise PreventUpdate
+
+    parsed_files = {}
+    for fn, fdata in files_data.items():
+        parsed_files[fn] = {"df": pd.read_json(io.StringIO(fdata["df_json"]), orient="split")}
+
+    visible_filenames = visible_filenames if visible_filenames else list(files_data.keys())
+    freq_meta = freq_meta or {}
+    unit = freq_meta.get("unit", "GHz")
+
+    fmin       = fmin       if fmin       is not None else freq_meta.get("disp_min", 0)
+    fmax       = fmax       if fmax       is not None else freq_meta.get("disp_max", 1)
+    amp_min    = amp_min    if amp_min    is not None else -100.0
+    amp_max    = amp_max    if amp_max    is not None else 0.0
+    line_width = line_width or 2
+
+    # 組裝 markers_list（從 State 讀）
+    store_ids = list((marker_store or {}).keys())
+    markers_list = []
+    for i, freq_val in enumerate(m_freqs):
+        if freq_val is None:
+            continue
+        m_id_str = store_ids[i] if i < len(store_ids) else str(i + 1)
+        markers_list.append({
+            "freq":           freq_val,
+            "label":          f"M{m_id_str}: {freq_val:.3f} {unit}",
+            "color":          m_colors[i] if i < len(m_colors) and m_colors[i] else DEFAULT_MARKER_COLORS[i % 10],
+            "style":          "vertical",
+            "show_in_legend": bool(m_shows[i]) if i < len(m_shows) else True,
+        })
+
+    # 組裝 threshold_markers_list（label 自動由 dB 值生成）
+    threshold_markers_list = []
+    y_unit = get_y_axis_unit(data_type)
+    threshold_store = threshold_store or {}
+    t_store_ids = list(threshold_store.keys())
+    for i, t_val in enumerate(t_values):
+        if t_val is None:
+            continue
+        t_id_str = t_store_ids[i] if i < len(t_store_ids) else str(i + 1)
+        threshold_markers_list.append({
+            "value":          t_val,
+            "label":          f"T{t_id_str}: {t_val:.1f} {y_unit}",
+            "id_str":         t_id_str,
+            "color":          t_colors[i] if i < len(t_colors) and t_colors[i] else DEFAULT_MARKER_COLORS[i % 10],
+            "show_in_legend": bool(t_shows[i]) if i < len(t_shows) else True,
+        })
+
+    # 只畫主曲線 + threshold
+    fig, threshold_crossings, base_trace_count, threshold_shape_map = build_base_figure(
+        files_data=parsed_files,
+        visible_filenames=visible_filenames,
+        selected_param=param,
+        selected_data_type=data_type,
+        freq_range=(fmin, fmax),
+        amp_range=(amp_min, amp_max),
+        threshold_markers_list=threshold_markers_list,
+        line_width=line_width,
+        num_markers=len(markers_list),
+    )
+
+    # threshold annotations 在 marker overlay 加入前提取（純 threshold 標籤）
+    threshold_annotations_json = [ann.to_plotly_json() for ann in fig.layout.annotations]
+
+    # 加上 marker overlay（在此也畫一次，保持初始狀態正確）
+    overlay_traces, shapes, annotations, marker_values, shape_index_map = compute_marker_overlay(
+        files_data=parsed_files,
+        visible_filenames=visible_filenames,
+        selected_param=param,
+        selected_data_type=data_type,
+        markers_list=markers_list,
+    )
+    for trace in overlay_traces:
+        fig.add_trace(trace)
+    for shape in shapes:
+        fig.add_shape(**shape)
+    for ann in annotations:
+        fig.add_annotation(**ann)
+
+    selected_param_full = f"{param}_{data_type}"
+    y_axis_unit_str = get_y_axis_unit(data_type)
+    is_smith = data_type == "smith"
+    n_thresh = len(threshold_shape_map)
+    shape_index_map_str = {str(int(k) + n_thresh): v for k, v in shape_index_map.items()}
+    threshold_shape_map_str = {str(k): v for k, v in threshold_shape_map.items()}
+
+    graph = dcc.Graph(
+        id="main-graph",
+        figure=fig,
+        config={
+            "responsive": True,
+            "displayModeBar": True,
+            "displaylogo": False,
+            "editable": True,
+            "edits": {
+                "shapePosition": True,
+                "annotationPosition": False, "annotationTail": False,
+                "annotationText": False, "axisTitleText": False,
+                "colorbarPosition": False, "legendPosition": False,
+                "legendText": False, "titleText": False,
+            },
+            "toImageButtonOptions": {
+                "format": "png",
+                "filename": f"s_parameter_{selected_param_full}",
+                "height": 800, "width": 1400, "scale": 2,
+            },
+        },
+    )
+
+    # 表格區塊放在 id="tables-area" 讓 overlay callback 可以單獨更新
+    tables_children = []
+    if markers_list and marker_values:
+        marker_df = build_marker_table(marker_values, visible_filenames, unit, y_axis_unit_str)
+        tables_children += [
+            html.H3("📊 Marker Values Overview", style={"fontSize": "16px", "marginTop": "20px"}),
+            df_to_dash_table(marker_df, "table-markers"),
+        ]
+    if threshold_markers_list and threshold_crossings:
+        thresh_df = build_threshold_table(threshold_crossings, visible_filenames, unit)
+        tables_children += [
+            html.H3("📐 Threshold Crossing Frequencies", style={"fontSize": "16px", "marginTop": "20px"}),
+            df_to_dash_table(thresh_df, "table-thresholds"),
+        ]
+    if not is_smith:
+        stats_df = build_stats_table(parsed_files, visible_filenames, selected_param_full, (fmin, fmax))
+        if not stats_df.empty:
+            tables_children += [
+                html.H3("📊 Data Statistics", style={"fontSize": "16px", "marginTop": "20px"}),
+                df_to_dash_table(stats_df, "table-stats"),
+            ]
+
+    raw_sections = []
+    for fname in visible_filenames:
+        if fname not in parsed_files:
+            continue
+        df_conv, _ = auto_convert_frequency(parsed_files[fname]["df"])
+        df_filt = filter_by_frequency_range(df_conv, fmin, fmax)
+        raw_sections.append(html.Details([
+            html.Summary(f"📄 {get_display_name(fname)}",
+                         style={"cursor": "pointer", "fontSize": "14px", "marginBottom": "6px"}),
+            df_to_dash_table(df_filt.round(6), f"raw-{fname}"),
+        ], style={"marginBottom": "12px"}))
+    if raw_sections:
+        tables_children += [
+            html.H3("📋 Raw Data", style={"fontSize": "16px", "marginTop": "20px"}),
+            html.Div(raw_sections),
+        ]
+
+    graph_height = fig.layout.height or 600
+
+    content_children = [
+        # 明確給高度的 block 容器，防止 responsive 模式造成表格重疊
+        html.Div(
+            graph,
+            style={
+                "height": f"{graph_height}px",
+                "display": "block",
+                "position": "relative",
+                "width": "100%",
+            },
+        ),
+        html.Div(id="tables-area", children=tables_children,
+                 style={"display": "block", "width": "100%", "marginTop": "4px"}),
+    ]
+
+    return content_children, shape_index_map_str, base_trace_count, threshold_shape_map_str, threshold_annotations_json
+
+
+# ── 12. 圖上拖動 marker/threshold → 同步 sidebar ──────────
+@callback(
+    Output({"type": "marker-freq",    "index": ALL}, "value"),
+    Output({"type": "threshold-value","index": ALL}, "value"),
+    Input("main-graph", "relayoutData"),
+    State("store-shape-index-map",     "data"),
+    State("store-threshold-shape-map", "data"),
+    State({"type": "marker-freq",    "index": ALL}, "value"),
+    State({"type": "threshold-value","index": ALL}, "value"),
+    prevent_initial_call=True,
+)
+def sync_marker_from_drag(
+    relayout_data,
+    shape_index_map, threshold_shape_map,
+    current_freqs, current_thresholds,
+):
+    """
+    拖動後同步 sidebar input：
+    - 垂直 marker shape  → x0/x1 → 更新 marker-freq
+    - 水平 threshold shape → y0/y1 → 更新 threshold-value
+    """
+    if not relayout_data:
+        raise PreventUpdate
+
+    # 收集所有被拖動的 shape 的座標變化
+    shape_coords: dict[int, dict[str, float]] = {}
+    for key, val in relayout_data.items():
+        if not key.startswith("shapes["):
+            continue
+        try:
+            shape_idx = int(key.split("[")[1].split("]")[0])
+            coord_key = key.split("].")[-1]   # x0 / x1 / y0 / y1
+            if coord_key not in ("x0", "x1", "y0", "y1"):
+                continue
+            if shape_idx not in shape_coords:
+                shape_coords[shape_idx] = {}
+            shape_coords[shape_idx][coord_key] = float(val)
+        except (IndexError, ValueError):
+            continue
+
+    if not shape_coords:
+        raise PreventUpdate
+
+    new_freqs      = list(current_freqs)
+    new_thresholds = list(current_thresholds)
+    freq_updated = False
+    thresh_updated = False
+
+    for shape_idx, coords in shape_coords.items():
+        s_key = str(shape_idx)
+
+        # ── 垂直 marker：x0/x1 → marker-freq ──
+        if shape_index_map and s_key in shape_index_map:
+            x_vals = [v for k, v in coords.items() if k in ("x0", "x1")]
+            if x_vals:
+                new_x = round(sum(x_vals) / len(x_vals), 4)
+                marker_idx = shape_index_map[s_key]
+                if marker_idx < len(new_freqs):
+                    new_freqs[marker_idx] = new_x
+                    freq_updated = True
+
+        # ── 水平 threshold：y0/y1 → threshold-value ──
+        elif threshold_shape_map and s_key in threshold_shape_map:
+            y_vals = [v for k, v in coords.items() if k in ("y0", "y1")]
+            if y_vals:
+                new_y = round(sum(y_vals) / len(y_vals), 2)
+                t_id_str = threshold_shape_map[s_key]
+                # ctx.states_list[3] 對應第 4 個 State：threshold-value ALL
+                for t_idx, item in enumerate(ctx.states_list[3]):
+                    if str(item["id"]["index"]) == t_id_str:
+                        if t_idx < len(new_thresholds):
+                            new_thresholds[t_idx] = new_y
+                            thresh_updated = True
+                        break
+
+    if not freq_updated and not thresh_updated:
+        raise PreventUpdate
+
+    return new_freqs, new_thresholds
+
+
+# ── 12a. marker freq 變動 / marker 數量歸零 → 輕量更新 overlay trace + 表格 ─
+@callback(
+    Output("main-graph", "figure"),
+    Output("tables-area", "children"),
+    Output("store-shape-index-map", "data", allow_duplicate=True),
+    Input({"type": "marker-freq",        "index": ALL}, "value"),
+    Input({"type": "marker-color",       "index": ALL}, "value"),
+    Input({"type": "marker-show-legend", "index": ALL}, "value"),
+    Input("num-markers", "data"),
+    State("store-files-data", "data"),
+    State("dd-param", "value"),
+    State("dd-datatype", "value"),
+    State("file-checklist", "value"),
+    State("store-base-trace-count", "data"),
+    State("store-freq-meta", "data"),
+    State("freq-min", "value"),
+    State("freq-max", "value"),
+    State("store-threshold-shape-map", "data"),
+    State("store-threshold-annotations", "data"),
+    State({"type": "threshold-value", "index": ALL}, "value"),
+    State({"type": "threshold-color", "index": ALL}, "value"),
+    State("num-thresholds", "data"),
+    prevent_initial_call=True,
+)
+def update_marker_overlay(
+    m_freqs, m_colors, m_shows,
+    marker_store,
+    files_data, param, data_type,
+    visible_filenames, base_trace_count,
+    freq_meta, fmin, fmax,
+    threshold_shape_map,
+    threshold_annotations_stored,
+    t_values, t_colors,
+    threshold_store,
+):
+    """只更新 marker overlay（shapes + 讀值 trace），不重畫主曲線。
+    同時重建 threshold / stats 表格，確保它們不因 marker 更新而消失。"""
+    if not files_data or not param or not data_type:
+        raise PreventUpdate
+
+    from dash import Patch
+    base_trace_count = base_trace_count or 0
+    freq_meta = freq_meta or {}
+    unit = freq_meta.get("unit", "GHz")
+    y_axis_unit = get_y_axis_unit(data_type)
+    selected_param_full = f"{param}_{data_type}"
+    is_smith = data_type == "smith"
+    n_threshold_shapes = len(threshold_shape_map) if threshold_shape_map else 0
+    threshold_annotations_stored = threshold_annotations_stored or []
+
+    parsed_files = {}
+    for fn, fdata in files_data.items():
+        parsed_files[fn] = {"df": pd.read_json(io.StringIO(fdata["df_json"]), orient="split")}
+
+    visible_filenames = visible_filenames if visible_filenames else list(files_data.keys())
+    fmin = fmin if fmin is not None else freq_meta.get("disp_min", 0)
+    fmax = fmax if fmax is not None else freq_meta.get("disp_max", 1)
+
+    # 重建 threshold crossing 表格所需資料
+    threshold_markers_list = []
+    threshold_store = threshold_store or {}
+    t_store_ids = list(threshold_store.keys())
+    for i, t_val in enumerate(t_values or []):
+        if t_val is None:
+            continue
+        t_id_str = t_store_ids[i] if i < len(t_store_ids) else str(i + 1)
+        threshold_markers_list.append({
+            "value": t_val,
+            "label": f"T{t_id_str}: {t_val:.1f} {y_axis_unit}",
+            "color": t_colors[i] if i < len(t_colors) and t_colors[i] else DEFAULT_MARKER_COLORS[i % 10],
+        })
+
+    threshold_crossings: dict = {}
+    if threshold_markers_list and not is_smith:
+        for t_marker in threshold_markers_list:
+            t_label = t_marker["label"]
+            t_val = t_marker["value"]
+            threshold_crossings[t_label] = {}
+            for fname, finfo in parsed_files.items():
+                df_conv, _ = auto_convert_frequency(finfo["df"])
+                if selected_param_full not in df_conv.columns:
+                    continue
+                df_filt = filter_by_frequency_range(df_conv, fmin, fmax)
+                crossings = find_threshold_crossings(df_filt, selected_param_full, t_val)
+                threshold_crossings[t_label][get_display_name(fname)] = crossings
+
+    # 靜態表格（threshold crossing + data statistics）
+    static_tables = []
+    if threshold_markers_list and threshold_crossings:
+        thresh_df = build_threshold_table(threshold_crossings, visible_filenames, unit)
+        static_tables += [
+            html.H3("📐 Threshold Crossing Frequencies", style={"fontSize": "16px", "marginTop": "20px"}),
+            df_to_dash_table(thresh_df, "table-thresholds"),
+        ]
+    if not is_smith:
+        stats_df = build_stats_table(parsed_files, visible_filenames, selected_param_full, (fmin, fmax))
+        if not stats_df.empty:
+            static_tables += [
+                html.H3("📊 Data Statistics", style={"fontSize": "16px", "marginTop": "20px"}),
+                df_to_dash_table(stats_df, "table-stats"),
+            ]
+
+    _invisible_shape = dict(
+        type="line", x0=0, x1=0, y0=0, y1=0,
+        xref="paper", yref="paper",
+        line=dict(color="rgba(0,0,0,0)", width=0), opacity=0,
+    )
+    patched_fig = Patch()
+
+    # marker 全部清空時：清除 marker shapes 和 overlay traces，保留 threshold annotations
+    if not m_freqs or not marker_store:
+        patched_fig["layout"]["annotations"] = list(threshold_annotations_stored)
+        for i in range(50):
+            patched_fig["layout"]["shapes"][n_threshold_shapes + i] = _invisible_shape
+        for i in range(50):
+            patched_fig["data"][base_trace_count + i] = {
+                "type": "scatter", "x": [], "y": [],
+                "showlegend": False, "hoverinfo": "skip",
+            }
+        return patched_fig, static_tables, {}
+
+    store_ids = list(marker_store.keys())
+    markers_list = []
+    for i, freq_val in enumerate(m_freqs):
+        if freq_val is None:
+            continue
+        m_id_str = store_ids[i] if i < len(store_ids) else str(i + 1)
+        markers_list.append({
+            "freq":           freq_val,
+            "label":          f"M{m_id_str}: {freq_val:.3f} {unit}",
+            "color":          m_colors[i] if i < len(m_colors) and m_colors[i] else DEFAULT_MARKER_COLORS[i % 10],
+            "style":          "vertical",
+            "show_in_legend": bool(m_shows[i]) if i < len(m_shows) else True,
+        })
+
+    overlay_traces, shapes, annotations, marker_values, shape_index_map = compute_marker_overlay(
+        files_data=parsed_files,
+        visible_filenames=visible_filenames,
+        selected_param=param,
+        selected_data_type=data_type,
+        markers_list=markers_list,
+    )
+
+    offset_shape_index_map = {
+        str(int(k) + n_threshold_shapes): v
+        for k, v in shape_index_map.items()
+    }
+
+    for i, s in enumerate(shapes):
+        patched_fig["layout"]["shapes"][n_threshold_shapes + i] = s
+    for i in range(len(shapes), 50):
+        patched_fig["layout"]["shapes"][n_threshold_shapes + i] = _invisible_shape
+
+    # threshold annotations 保留 + marker annotations 附加
+    patched_fig["layout"]["annotations"] = list(threshold_annotations_stored) + list(annotations)
+
+    new_data = [t.to_plotly_json() for t in overlay_traces]
+    for i in range(50):
+        patched_fig["data"][base_trace_count + i] = {
+            "type": "scatter", "x": [], "y": [],
+            "showlegend": False, "hoverinfo": "skip",
+        }
+    for i, trace_json in enumerate(new_data):
+        patched_fig["data"][base_trace_count + i] = trace_json
+
+    tables_children = []
+    if markers_list and marker_values:
+        marker_df = build_marker_table(marker_values, visible_filenames, unit, y_axis_unit)
+        tables_children += [
+            html.H3("📊 Marker Values Overview", style={"fontSize": "16px", "marginTop": "20px"}),
+            df_to_dash_table(marker_df, "table-markers"),
+        ]
+    tables_children += static_tables
+
+    return patched_fig, tables_children, offset_shape_index_map
+
+
+# ============================================================
+# Entry point
+# ============================================================
+if __name__ == "__main__":
+    app.run(debug=True, port=8501)
