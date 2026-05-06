@@ -43,6 +43,22 @@ from dash.exceptions import PreventUpdate
 warnings.filterwarnings("ignore", message=".*keyword arguments have been deprecated.*")
 
 # ============================================================
+# Version
+# ============================================================
+APP_VERSION = "1.0.1"
+
+# v1.0.1  2026-05-06
+#   - fix: threshold crossings now respect frequency range filter
+#   - ui: update empty-state message
+#
+# v1.0.0  2026-05-05
+#   - migrated from Streamlit to Dash
+#   - freq / amplitude range filter
+#   - vertical markers + threshold markers with drag support
+#   - Smith Chart support
+#   - deployed on Render
+
+# ============================================================
 # App 初始化
 # ============================================================
 app = Dash(
@@ -313,7 +329,8 @@ def build_base_figure(
                 df_conv, _ = auto_convert_frequency(file_info["df"])
                 if selected_param_full not in df_conv.columns:
                     continue
-                crossings = find_threshold_crossings(df_conv, selected_param_full, t_val)
+                df_filt_thresh = filter_by_frequency_range(df_conv, freq_range[0], freq_range[1])
+                crossings = find_threshold_crossings(df_filt_thresh, selected_param_full, t_val)
                 display_name = get_display_name(filename)
                 threshold_crossings[t_label][display_name] = crossings
                 line_color = COLOR_PALETTE[idx % len(COLOR_PALETTE)]
@@ -822,12 +839,12 @@ app.layout = html.Div([
 
         # ════ 主內容區 ════
         html.Div([
-            html.H1("📊 S-parameter Viewer", style={"fontSize": "22px", "marginBottom": "4px", "marginTop": 0}),
+            html.H1(f"📊 S-parameter Viewer  (v{APP_VERSION})", style={"fontSize": "32px", "marginBottom": "4px", "marginTop": 0}),
             html.P("Upload multiple .snp files (.s1p, .s2p, .s4p, etc.) for plotting comparison and analysis",
                    style={"color": "#6c757d", "fontSize": "14px", "marginBottom": "16px"}),
 
             html.Div(id="main-content", children=[
-                html.Div("👈 Please upload .snp files from the left sidebar to start",
+                html.Div("Drop .snp files anywhere on the page, or browse from the sidebar",
                          style={"padding": "40px", "textAlign": "center", "color": "#6c757d",
                                 "backgroundColor": "#f8f9fa", "borderRadius": "8px",
                                 "border": "2px dashed #dee2e6"})
