@@ -45,8 +45,16 @@ warnings.filterwarnings("ignore", message=".*keyword arguments have been depreca
 # ============================================================
 # Version
 # ============================================================
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.2"
 
+# v1.0.2  2026-05-06
+#   - feat: threshold Peak / -3 dB / Dip preset buttons
+#   - fix: param type switch now preserves data type selection
+#   - fix: threshold preset value uses exact precision (no rounding loss)
+#   - fix: marker/threshold input step="any" allows arbitrary decimals
+#   - fix: pd.read_json suppress date-parse UserWarning (convert_dates=False)
+#   - ui: preset buttons hover effect, equal-width fill sidebar
+#
 # v1.0.1  2026-05-06
 #   - fix: threshold crossings now respect frequency range filter
 #   - ui: update empty-state message
@@ -910,12 +918,12 @@ def handle_upload(queue_data, existing_data):
     # 計算頻率 meta（以第一個檔案為準）
     freq_meta = {}
     if existing_data:
-        first_df = pd.read_json(io.StringIO(list(existing_data.values())[0]["df_json"]), orient="split")
+        first_df = pd.read_json(io.StringIO(list(existing_data.values())[0]["df_json"]), orient="split", convert_dates=False)
         _, unit, factor = auto_convert_frequency(first_df, return_unit_factor=True)
         all_mins = []
         all_maxs = []
         for fdata in existing_data.values():
-            df = pd.read_json(io.StringIO(fdata["df_json"]), orient="split")
+            df = pd.read_json(io.StringIO(fdata["df_json"]), orient="split", convert_dates=False)
             all_mins.append(df["Frequency"].min())
             all_maxs.append(df["Frequency"].max())
         freq_meta = {
@@ -1025,11 +1033,11 @@ def delete_single_file(del_clicks, files_data):
 
     freq_meta = {}
     if files_data:
-        first_df = pd.read_json(io.StringIO(list(files_data.values())[0]["df_json"]), orient="split")
+        first_df = pd.read_json(io.StringIO(list(files_data.values())[0]["df_json"]), orient="split", convert_dates=False)
         _, unit, factor = auto_convert_frequency(first_df, return_unit_factor=True)
         all_mins, all_maxs = [], []
         for fdata in files_data.values():
-            df = pd.read_json(io.StringIO(fdata["df_json"]), orient="split")
+            df = pd.read_json(io.StringIO(fdata["df_json"]), orient="split", convert_dates=False)
             all_mins.append(df["Frequency"].min())
             all_maxs.append(df["Frequency"].max())
         freq_meta = {
@@ -1051,7 +1059,7 @@ def delete_single_file(del_clicks, files_data):
 def update_param_dropdown(files_data):
     if not files_data:
         return [], None
-    first_df = pd.read_json(io.StringIO(list(files_data.values())[0]["df_json"]), orient="split")
+    first_df = pd.read_json(io.StringIO(list(files_data.values())[0]["df_json"]), orient="split", convert_dates=False)
     params = get_available_parameters(first_df)
     default = "S21" if "S21" in params else (params[0] if params else None)
     return params, default
@@ -1063,13 +1071,15 @@ def update_param_dropdown(files_data):
     Output("dd-datatype", "value"),
     Input("dd-param", "value"),
     State("store-files-data", "data"),
+    State("dd-datatype", "value"),
 )
-def update_datatype_dropdown(param, files_data):
+def update_datatype_dropdown(param, files_data, current_datatype):
     if not param or not files_data:
         return [], None
-    first_df = pd.read_json(io.StringIO(list(files_data.values())[0]["df_json"]), orient="split")
+    first_df = pd.read_json(io.StringIO(list(files_data.values())[0]["df_json"]), orient="split", convert_dates=False)
     dtypes = get_data_types(first_df, param)
-    return dtypes, (dtypes[0] if dtypes else None)
+    value = current_datatype if current_datatype in dtypes else (dtypes[0] if dtypes else None)
+    return dtypes, value
 
 
 # ── 5. 初始化頻率範圍輸入 ────────────────────────────────
@@ -1120,7 +1130,7 @@ def update_amp_range(param, data_type, fmin, fmax, files_data, freq_meta):
 
     all_vals = []
     for fdata in files_data.values():
-        df = pd.read_json(io.StringIO(fdata["df_json"]), orient="split")
+        df = pd.read_json(io.StringIO(fdata["df_json"]), orient="split", convert_dates=False)
         df_conv, _ = auto_convert_frequency(df)
         df_filt = filter_by_frequency_range(df_conv, fmin, fmax)
         if selected_param_full in df_filt.columns:
@@ -1244,7 +1254,7 @@ def render_marker_inputs(store, freq_meta):
                                  "flexShrink": "0", "marginRight": "8px"}),
                 dcc.Input(
                     id={"type": "marker-freq", "index": m_id},
-                    type="number", value=freq_val, debounce=True, step=0.1,
+                    type="number", value=freq_val, debounce=True, step="any",
                     style={"flex": "1", "minWidth": "0", "padding": "2px 4px",
                            "fontSize": "12px", "border": "1px solid #ced4da",
                            "borderRadius": "4px", "textAlign": "center"},
@@ -1321,7 +1331,7 @@ def render_threshold_inputs(store, data_type):
                                  "flexShrink": "0", "marginRight": "8px"}),
                 dcc.Input(
                     id={"type": "threshold-value", "index": t_id},
-                    type="number", value=round(t_val, 2), debounce=True, step=0.5,
+                    type="number", value=t_val, debounce=True, step="any",
                     style={"flex": "1", "minWidth": "0", "padding": "2px 4px",
                            "fontSize": "12px", "border": "1px solid #ced4da",
                            "borderRadius": "4px", "textAlign": "center"},
@@ -1357,6 +1367,23 @@ def render_threshold_inputs(store, data_type):
         )
         body = html.Div([
             html.Div([
+                html.Button(
+                    "Peak", id={"type": "threshold-peak-btn", "index": t_id}, n_clicks=0,
+                    title="Set to Peak (max within freq range)",
+                    className="threshold-preset-btn",
+                ),
+                html.Button(
+                    "- 3 dB", id={"type": "threshold-3db-btn", "index": t_id}, n_clicks=0,
+                    title="Set to Peak - 3 dB (3dB bandwidth reference)",
+                    className="threshold-preset-btn",
+                ),
+                html.Button(
+                    "Dip", id={"type": "threshold-dip-btn", "index": t_id}, n_clicks=0,
+                    title="Set to Dip (min within freq range)",
+                    className="threshold-preset-btn",
+                ),
+            ], style={"display": "flex", "gap": "6px", "marginBottom": "6px", "paddingLeft": "8px", "paddingRight": "8px"}),
+            html.Div([
                 html.Div([
                     label("Color"),
                     color_dropdown({"type": "threshold-color", "index": t_id}, default_index=pos),
@@ -1376,6 +1403,70 @@ def render_threshold_inputs(store, data_type):
             style={"borderBottom": "1px solid #eee", "paddingBottom": "4px", "marginBottom": "2px"},
         ))
     return children
+
+
+# ── 8b. Threshold Peak / Dip 按鈕 ────────────────────────
+@callback(
+    Output({"type": "threshold-value", "index": ALL}, "value", allow_duplicate=True),
+    Input({"type": "threshold-peak-btn", "index": ALL}, "n_clicks"),
+    Input({"type": "threshold-dip-btn",  "index": ALL}, "n_clicks"),
+    Input({"type": "threshold-3db-btn",  "index": ALL}, "n_clicks"),
+    State("store-files-data", "data"),
+    State("dd-param", "value"),
+    State("dd-datatype", "value"),
+    State("file-checklist", "value"),
+    State("freq-min", "value"),
+    State("freq-max", "value"),
+    State("store-freq-meta", "data"),
+    prevent_initial_call=True,
+)
+def set_threshold_peak_dip(
+    peak_clicks, dip_clicks, db3_clicks,
+    files_data, param, data_type, visible_filenames,
+    fmin, fmax, freq_meta,
+):
+    tid = ctx.triggered_id
+    if not isinstance(tid, dict) or tid.get("type") not in (
+        "threshold-peak-btn", "threshold-dip-btn", "threshold-3db-btn"
+    ):
+        raise PreventUpdate
+    if not any(peak_clicks + dip_clicks + db3_clicks):
+        raise PreventUpdate
+    if not files_data or not param or not data_type or data_type == "smith":
+        raise PreventUpdate
+
+    triggered_index = str(tid["index"])
+    selected_param_full = f"{param}_{data_type}"
+    freq_meta = freq_meta or {}
+    fmin = fmin if fmin is not None else freq_meta.get("disp_min", 0)
+    fmax = fmax if fmax is not None else freq_meta.get("disp_max", 1)
+    visible_filenames = visible_filenames or list(files_data.keys())
+
+    all_vals = []
+    for fn in visible_filenames:
+        if fn not in files_data:
+            continue
+        df = pd.read_json(io.StringIO(files_data[fn]["df_json"]), orient="split", convert_dates=False)
+        df_conv, _ = auto_convert_frequency(df)
+        df_filt = filter_by_frequency_range(df_conv, fmin, fmax)
+        if selected_param_full in df_filt.columns:
+            all_vals.extend(df_filt[selected_param_full].dropna().tolist())
+
+    if not all_vals:
+        raise PreventUpdate
+
+    t_type = tid["type"]
+    if t_type == "threshold-peak-btn":
+        new_val = float(max(all_vals))
+    elif t_type == "threshold-dip-btn":
+        new_val = float(min(all_vals))
+    else:  # -3dB
+        new_val = float(max(all_vals)) - 3.0
+
+    return [
+        new_val if str(item["id"]["index"]) == triggered_index else no_update
+        for item in ctx.inputs_list[0]
+    ]
 
 
 # ── 9. 檔案勾選清單 ──────────────────────────────────────
@@ -1520,7 +1611,7 @@ def update_main(
 
     parsed_files = {}
     for fn, fdata in files_data.items():
-        parsed_files[fn] = {"df": pd.read_json(io.StringIO(fdata["df_json"]), orient="split")}
+        parsed_files[fn] = {"df": pd.read_json(io.StringIO(fdata["df_json"]), orient="split", convert_dates=False)}
 
     visible_filenames = visible_filenames if visible_filenames else list(files_data.keys())
     freq_meta = freq_meta or {}
@@ -1817,7 +1908,7 @@ def update_marker_overlay(
 
     parsed_files = {}
     for fn, fdata in files_data.items():
-        parsed_files[fn] = {"df": pd.read_json(io.StringIO(fdata["df_json"]), orient="split")}
+        parsed_files[fn] = {"df": pd.read_json(io.StringIO(fdata["df_json"]), orient="split", convert_dates=False)}
 
     visible_filenames = visible_filenames if visible_filenames else list(files_data.keys())
     fmin = fmin if fmin is not None else freq_meta.get("disp_min", 0)
