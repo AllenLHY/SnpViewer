@@ -39,3 +39,12 @@ details[open] > summary::before {
     background-color: #cce5ff;
     border-color: #66b2ff;
 }
+
+.counter-btn {
+    transition: background-color 0.15s ease, border-color 0.15s ease;
+}
+
+.counter-btn:hover {
+    background-color: #f0f0f0 !important;
+    border-color: #adb5bd !important;
+}

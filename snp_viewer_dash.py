@@ -109,8 +109,13 @@ def color_dropdown(component_id, default_index: int = 0):
 # 純計算函數（與 Streamlit 版完全相同，直接搬移）
 # ============================================================
 
-def parse_sparameter_file(filename: str, file_content: str) -> pd.DataFrame:
-    """解析 Touchstone 檔案，回傳含 mag/phase/real/imag 欄位的 DataFrame"""
+def fmt_complex(c: complex, decimals: int = 2) -> str:
+    sign = "+" if c.imag >= 0 else "-"
+    return f"{c.real:.{decimals}f} {sign} j{abs(c.imag):.{decimals}f}"
+
+
+def parse_sparameter_file(filename: str, file_content: str) -> tuple[pd.DataFrame, float]:
+    """解析 Touchstone 檔案，回傳 (DataFrame, z0)。z0 從檔案讀取，讀不到預設 50.0。"""
     suffix = os.path.splitext(filename)[1]
     with tempfile.NamedTemporaryFile(mode="w", suffix=suffix, delete=False) as tmp:
         tmp.write(file_content)
@@ -119,6 +124,11 @@ def parse_sparameter_file(filename: str, file_content: str) -> pd.DataFrame:
         network = rf.Network(tmp_path)
     finally:
         os.remove(tmp_path)
+
+    try:
+        z0 = float(np.real(network.z0[0, 0]))
+    except Exception:
+        z0 = 50.0
 
     freq = network.frequency.f
     n_ports = network.number_of_ports
@@ -131,7 +141,7 @@ def parse_sparameter_file(filename: str, file_content: str) -> pd.DataFrame:
             data[f"{name}_phase"] = np.angle(s, deg=True)
             data[f"{name}_real"]  = np.real(s)
             data[f"{name}_imag"]  = np.imag(s)
-    return pd.DataFrame(data)
+    return pd.DataFrame(data), z0
 
 
 def get_available_parameters(df: pd.DataFrame) -> list[str]:
@@ -517,6 +527,114 @@ def compute_marker_overlay(
     return overlay_traces, shapes, annotations, marker_values, shape_index_map
 
 
+def build_smith_marker_overlays(
+    files_data: dict,
+    visible_filenames: list[str],
+    selected_param: str,
+    smith_markers_list: list,
+) -> tuple[list, dict]:
+    """
+    為每個 smith marker × visible file 建立 Scattersmith dot trace。
+    回傳 (overlay_traces, marker_values)
+    marker_values: {label: [(display_name, actual_freq, gamma_r, gamma_i, z_r, z_i), ...]}
+    """
+    if not smith_markers_list:
+        return [], {}
+
+    visible_files = {k: files_data[k] for k in visible_filenames if k in files_data}
+    if not visible_files:
+        return [], {}
+
+    first_df = list(visible_files.values())[0]["df"]
+    _, freq_unit, _ = auto_convert_frequency(first_df, return_unit_factor=True)
+
+    overlay_traces = []
+    marker_values: dict = {}
+
+    for marker in smith_markers_list:
+        m_freq  = marker["freq"]
+        m_label = marker["label"]
+        m_color = marker["color"]
+        short_label = m_label.split(":")[0]   # e.g. "M1"
+        marker_values[m_label] = []
+
+        for idx, (filename, file_info) in enumerate(visible_files.items()):
+            df_conv, _ = auto_convert_frequency(file_info["df"])
+            real_col = f"{selected_param}_real"
+            imag_col = f"{selected_param}_imag"
+            if real_col not in df_conv.columns or imag_col not in df_conv.columns:
+                continue
+
+            z0 = float(file_info.get("z0", 50.0))
+
+            row_idx = (df_conv["Frequency"] - m_freq).abs().idxmin()
+            actual_freq = float(df_conv.loc[row_idx, "Frequency"])
+            actual_real = float(df_conv.loc[row_idx, real_col])
+            actual_imag = float(df_conv.loc[row_idx, imag_col])
+
+            gamma = actual_real + 1j * actual_imag
+            z     = z0 * (1 + gamma) / (1 - gamma)
+            y     = (1 / z) * 1000  # mS
+
+            display_name = get_display_name(filename)
+            marker_values[m_label].append(
+                (display_name, actual_freq, z0, gamma, z, y)
+            )
+
+            overlay_traces.append(go.Scattersmith(
+                real=[float(np.real(z / z0))],
+                imag=[float(np.imag(z / z0))],
+                customdata=[[
+                    actual_freq,
+                    float(np.real(gamma)), float(np.imag(gamma)),
+                    float(np.real(z)),     float(np.imag(z)),
+                    float(np.real(y)),     float(np.imag(y)),
+                    z0,
+                ]],
+                mode="markers+text",
+                text=[short_label],
+                textposition="top center",
+                textfont=dict(color=m_color, size=12),
+                marker=dict(
+                    color=m_color,
+                    size=10,
+                    symbol="circle",
+                    line=dict(color="white", width=1.5),
+                ),
+                name=f"{display_name} @ {m_label}",
+                showlegend=False,
+                hovertemplate=(
+                    f"<b>{m_label}</b><br>"
+                    f"<b>{display_name}</b><br>"
+                    f"Freq: %{{customdata[0]:.3f}} {freq_unit}<br>"
+                    f"Z₀: %{{customdata[7]:.0f}} Ω<br>"
+                    f"Γ: %{{customdata[1]:.2f}} %{{customdata[2]:+.2f}}j<br>"
+                    f"Z: %{{customdata[3]:.2f}} %{{customdata[4]:+.2f}}j Ω<br>"
+                    f"Y: %{{customdata[5]:.2f}} %{{customdata[6]:+.2f}}j mS<br>"
+                    "<extra></extra>"
+                ),
+            ))
+
+    return overlay_traces, marker_values
+
+
+def build_smith_marker_table(marker_values: dict, visible_filenames: list, freq_unit: str) -> pd.DataFrame:
+    """marker_values 轉成讀值 DataFrame（欄位：Marker, File, Freq, Z₀, Γ, Z, Y）"""
+    rows = []
+    for label, entries in marker_values.items():
+        for (display_name, actual_freq, z0, gamma, z, y) in entries:
+            rows.append({
+                "Marker":            label,
+                "File":              display_name,
+                f"Freq ({freq_unit})": round(actual_freq, 4),
+                "Z₀ (Ω)":           int(round(z0)),
+                "Γ":                 fmt_complex(gamma),
+                "Z (Ω)":             fmt_complex(z),
+                "Y (mS)":            fmt_complex(y),
+            })
+    return pd.DataFrame(rows)
+
+
 # 保留舊名稱作為 wrapper，方便測試相容
 def build_figure(
     files_data, visible_filenames, selected_param, selected_data_type,
@@ -751,41 +869,70 @@ app.layout = html.Div([
                 html.Div(id="amp-range-caption", style={"fontSize": "11px", "color": "#6c757d"}),
             ]),
 
-            # Marker
-            section("📍 Markers"),
-            dcc.Store(id="num-markers", data={}),
-            html.Div([
-                html.Button("−", id="btn-marker-dec", n_clicks=0, style={
-                    "width": "28px", "height": "28px", "border": "1px solid #ced4da",
-                    "borderRadius": "4px", "backgroundColor": "#fff", "cursor": "pointer",
-                    "fontSize": "16px", "lineHeight": "1", "padding": "0", "fontWeight": "500"}),
-                html.Span("0", id="num-markers-display", style={
-                    "minWidth": "28px", "textAlign": "center",
-                    "fontSize": "15px", "fontWeight": "500", "color": "#212529"}),
-                html.Button("+", id="btn-marker-inc", n_clicks=0, style={
-                    "width": "28px", "height": "28px", "border": "1px solid #ced4da",
-                    "borderRadius": "4px", "backgroundColor": "#fff", "cursor": "pointer",
-                    "fontSize": "16px", "lineHeight": "1", "padding": "0", "fontWeight": "500"}),
-            ], style={"display": "flex", "alignItems": "center", "gap": "8px", "marginBottom": "8px"}),
-            html.Div(id="markers-container"),
+            # Frequency-domain marker sections (hidden when Smith Chart)
+            html.Div(id="freq-marker-section", children=[
+                # Marker
+                section("📍 Markers"),
+                dcc.Store(id="num-markers", data={}),
+                html.Div([
+                    html.Button("−", id="btn-marker-dec", n_clicks=0, title="Remove last marker",
+                        className="counter-btn",
+                        style={"width": "28px", "height": "28px", "border": "1px solid #ced4da",
+                               "borderRadius": "4px", "backgroundColor": "#fff", "cursor": "pointer",
+                               "fontSize": "16px", "lineHeight": "1", "padding": "0", "fontWeight": "500"}),
+                    html.Span("0", id="num-markers-display", style={
+                        "minWidth": "28px", "textAlign": "center",
+                        "fontSize": "15px", "fontWeight": "500", "color": "#212529"}),
+                    html.Button("+", id="btn-marker-inc", n_clicks=0, title="Add marker",
+                        className="counter-btn",
+                        style={"width": "28px", "height": "28px", "border": "1px solid #ced4da",
+                               "borderRadius": "4px", "backgroundColor": "#fff", "cursor": "pointer",
+                               "fontSize": "16px", "lineHeight": "1", "padding": "0", "fontWeight": "500"}),
+                ], style={"display": "flex", "alignItems": "center", "gap": "8px", "marginBottom": "8px"}),
+                html.Div(id="markers-container"),
 
-            # Threshold Marker
-            section("📐 Threshold Markers"),
-            dcc.Store(id="num-thresholds", data={}),
-            html.Div([
-                html.Button("−", id="btn-threshold-dec", n_clicks=0, style={
-                    "width": "28px", "height": "28px", "border": "1px solid #ced4da",
-                    "borderRadius": "4px", "backgroundColor": "#fff", "cursor": "pointer",
-                    "fontSize": "16px", "lineHeight": "1", "padding": "0", "fontWeight": "500"}),
-                html.Span("0", id="num-thresholds-display", style={
-                    "minWidth": "28px", "textAlign": "center",
-                    "fontSize": "15px", "fontWeight": "500", "color": "#212529"}),
-                html.Button("+", id="btn-threshold-inc", n_clicks=0, style={
-                    "width": "28px", "height": "28px", "border": "1px solid #ced4da",
-                    "borderRadius": "4px", "backgroundColor": "#fff", "cursor": "pointer",
-                    "fontSize": "16px", "lineHeight": "1", "padding": "0", "fontWeight": "500"}),
-            ], style={"display": "flex", "alignItems": "center", "gap": "8px", "marginBottom": "8px"}),
-            html.Div(id="thresholds-container"),
+                # Threshold Marker
+                section("📐 Threshold Markers"),
+                dcc.Store(id="num-thresholds", data={}),
+                html.Div([
+                    html.Button("−", id="btn-threshold-dec", n_clicks=0, title="Remove last threshold",
+                        className="counter-btn",
+                        style={"width": "28px", "height": "28px", "border": "1px solid #ced4da",
+                               "borderRadius": "4px", "backgroundColor": "#fff", "cursor": "pointer",
+                               "fontSize": "16px", "lineHeight": "1", "padding": "0", "fontWeight": "500"}),
+                    html.Span("0", id="num-thresholds-display", style={
+                        "minWidth": "28px", "textAlign": "center",
+                        "fontSize": "15px", "fontWeight": "500", "color": "#212529"}),
+                    html.Button("+", id="btn-threshold-inc", n_clicks=0, title="Add threshold",
+                        className="counter-btn",
+                        style={"width": "28px", "height": "28px", "border": "1px solid #ced4da",
+                               "borderRadius": "4px", "backgroundColor": "#fff", "cursor": "pointer",
+                               "fontSize": "16px", "lineHeight": "1", "padding": "0", "fontWeight": "500"}),
+                ], style={"display": "flex", "alignItems": "center", "gap": "8px", "marginBottom": "8px"}),
+                html.Div(id="thresholds-container"),
+            ]),
+
+            # Smith Chart marker section (shown only when Smith Chart)
+            html.Div(id="smith-marker-section", style={"display": "none"}, children=[
+                section("📍 Smith Markers"),
+                dcc.Store(id="num-smith-markers", data={}),
+                html.Div([
+                    html.Button("−", id="btn-smith-marker-dec", n_clicks=0, title="Remove last Smith marker",
+                        className="counter-btn",
+                        style={"width": "28px", "height": "28px", "border": "1px solid #ced4da",
+                               "borderRadius": "4px", "backgroundColor": "#fff", "cursor": "pointer",
+                               "fontSize": "16px", "lineHeight": "1", "padding": "0", "fontWeight": "500"}),
+                    html.Span("0", id="num-smith-markers-display", style={
+                        "minWidth": "28px", "textAlign": "center",
+                        "fontSize": "15px", "fontWeight": "500", "color": "#212529"}),
+                    html.Button("+", id="btn-smith-marker-inc", n_clicks=0, title="Add Smith marker",
+                        className="counter-btn",
+                        style={"width": "28px", "height": "28px", "border": "1px solid #ced4da",
+                               "borderRadius": "4px", "backgroundColor": "#fff", "cursor": "pointer",
+                               "fontSize": "16px", "lineHeight": "1", "padding": "0", "fontWeight": "500"}),
+                ], style={"display": "flex", "alignItems": "center", "gap": "8px", "marginBottom": "8px"}),
+                html.Div(id="smith-markers-container"),
+            ]),
 
             # 檔案顯示切換
             section("📋 Select Files"),
@@ -847,7 +994,7 @@ app.layout = html.Div([
 
         # ════ 主內容區 ════
         html.Div([
-            html.H1(f"📊 S-parameter Viewer  (v{APP_VERSION})", style={"fontSize": "32px", "marginBottom": "4px", "marginTop": 0}),
+            html.H1(f"📊 S-parameter Viewer  [v{APP_VERSION}]", style={"fontSize": "32px", "marginBottom": "4px", "marginTop": 0}),
             html.P("Upload multiple .snp files (.s1p, .s2p, .s4p, etc.) for plotting comparison and analysis",
                    style={"color": "#6c757d", "fontSize": "14px", "marginBottom": "16px"}),
 
@@ -907,10 +1054,11 @@ def handle_upload(queue_data, existing_data):
                 file_str = file_bytes.decode("utf-8")
             except UnicodeDecodeError:
                 file_str = file_bytes.decode("latin-1")
-            df = parse_sparameter_file(filename, file_str)
+            df, z0 = parse_sparameter_file(filename, file_str)
             existing_data[filename] = {
                 "df_json": df.to_json(orient="split"),
                 "size_kb": size_kb,
+                "z0": z0,
             }
         except Exception as e:
             errors.append(f"❌ {filename}: {str(e)}")
@@ -1234,6 +1382,63 @@ def update_num_thresholds(inc, dec, del_clicks, t_vals, store, data_type):
     return store, str(len(store))
 
 
+# ── 6d. data type 切換：顯示對應 marker 控制區 ────────────
+@callback(
+    Output("freq-marker-section", "style"),
+    Output("smith-marker-section", "style"),
+    Input("dd-datatype", "value"),
+)
+def toggle_marker_sections(data_type):
+    is_smith = data_type == "smith"
+    return (
+        {"display": "none"} if is_smith else {"display": "block"},
+        {"display": "block"} if is_smith else {"display": "none"},
+    )
+
+
+# ── 6e. +/- 按鈕 & 個別刪除：Smith Marker store (dict) ───
+@callback(
+    Output("num-smith-markers", "data"),
+    Output("num-smith-markers-display", "children"),
+    Input("btn-smith-marker-inc", "n_clicks"),
+    Input("btn-smith-marker-dec", "n_clicks"),
+    Input({"type": "smith-marker-del-btn", "index": ALL}, "n_clicks"),
+    Input({"type": "smith-marker-freq",    "index": ALL}, "value"),
+    State("num-smith-markers", "data"),
+    State("store-freq-meta", "data"),
+    prevent_initial_call=True,
+)
+def update_num_smith_markers(inc, dec, del_clicks, freq_vals, store, freq_meta):
+    store = dict(store or {})
+    tid = ctx.triggered_id
+    freq_meta = freq_meta or {}
+    dmin = freq_meta.get("disp_min", 0)
+    dmax = freq_meta.get("disp_max", 1)
+    mid_freq = round((dmin + dmax) / 2, 3)
+
+    if isinstance(tid, dict) and tid.get("type") == "smith-marker-freq":
+        for item in ctx.inputs_list[3]:
+            m_id = str(item["id"]["index"])
+            if m_id in store and item.get("value") is not None:
+                store[m_id] = item["value"]
+        return store, str(len(store))
+
+    if tid == "btn-smith-marker-inc":
+        if len(store) < 10:
+            existing_ids = [int(k) for k in store]
+            next_id = str(max(existing_ids) + 1 if existing_ids else 1)
+            store[next_id] = mid_freq
+    elif tid == "btn-smith-marker-dec":
+        if store:
+            last_key = list(store.keys())[-1]
+            del store[last_key]
+    elif isinstance(tid, dict) and tid.get("type") == "smith-marker-del-btn":
+        del_key = str(tid["index"])
+        store.pop(del_key, None)
+
+    return store, str(len(store))
+
+
 # ── 7. 動態產生 Marker 輸入欄位 ─────────────────────────
 @callback(
     Output("markers-container", "children"),
@@ -1469,6 +1674,74 @@ def set_threshold_peak_dip(
     ]
 
 
+# ── 8b. 動態產生 Smith Marker 列表 ───────────────────────
+@callback(
+    Output("smith-markers-container", "children"),
+    Input("num-smith-markers", "data"),
+    State("store-freq-meta", "data"),
+)
+def render_smith_marker_inputs(store, freq_meta):
+    if not store or not freq_meta:
+        return []
+    unit = freq_meta.get("unit", "GHz")
+    children = []
+    for pos, (m_id_str, freq_val) in enumerate(store.items()):
+        m_id = int(m_id_str)
+        del_btn_style = {
+            "marginLeft": "6px",
+            "width": "20px", "height": "20px",
+            "border": "1px solid #f5c6cb",
+            "borderRadius": "50%",
+            "backgroundColor": "#fff0f0",
+            "color": "#c0392b",
+            "cursor": "pointer",
+            "fontSize": "13px",
+            "lineHeight": "1",
+            "padding": "0",
+            "fontWeight": "700",
+            "display": "inline-flex",
+            "alignItems": "center",
+            "justifyContent": "center",
+            "verticalAlign": "middle",
+            "flexShrink": "0",
+        }
+        summary = html.Summary(
+            html.Div([
+                html.Span(f"📌 M{m_id}",
+                          style={"fontWeight": "500", "fontSize": "13px",
+                                 "flexShrink": "0", "marginRight": "8px"}),
+                dcc.Input(
+                    id={"type": "smith-marker-freq", "index": m_id},
+                    type="number", value=freq_val, debounce=True, step="any",
+                    style={"flex": "1", "minWidth": "0", "padding": "2px 4px",
+                           "fontSize": "12px", "border": "1px solid #ced4da",
+                           "borderRadius": "4px", "textAlign": "center"},
+                ),
+                html.Span(f" {unit}", style={"fontSize": "12px", "color": "#6c757d",
+                                             "flexShrink": "0", "marginLeft": "2px"}),
+                html.Button(
+                    "×",
+                    id={"type": "smith-marker-del-btn", "index": m_id},
+                    n_clicks=0,
+                    title=f"Delete Smith Marker {m_id}",
+                    style=del_btn_style,
+                ),
+            ], style={"display": "flex", "alignItems": "center", "width": "100%"}),
+            style={"cursor": "pointer", "padding": "4px 0"},
+        )
+        body = html.Div([
+            html.Div([
+                label("Color"),
+                color_dropdown({"type": "smith-marker-color", "index": m_id}, default_index=pos),
+            ], style={"padding": "4px 0 4px 8px"}),
+        ])
+        children.append(html.Details(
+            [summary, body], open=(pos == 0),
+            style={"borderBottom": "1px solid #eee", "paddingBottom": "4px", "marginBottom": "2px"},
+        ))
+    return children
+
+
 # ── 9. 檔案勾選清單 ──────────────────────────────────────
 _CHECKLIST_VISIBLE_STYLE = {
     "fontSize": "12px", "maxHeight": "200px", "overflowY": "auto",
@@ -1588,6 +1861,10 @@ app.clientside_callback(
     State("num-markers", "data"),
     State("num-thresholds", "data"),
     State("store-freq-meta", "data"),
+    # Smith Markers
+    State({"type": "smith-marker-freq",  "index": ALL}, "value"),
+    State({"type": "smith-marker-color", "index": ALL}, "value"),
+    State("num-smith-markers", "data"),
 )
 def update_main(
     files_data, param, data_type,
@@ -1597,13 +1874,14 @@ def update_main(
     m_freqs, m_colors, m_shows,
     marker_store, threshold_store,
     freq_meta,
+    sm_freqs, sm_colors, smith_marker_store,
 ):
     if not files_data:
         return html.Div(
-            "👈 Please upload .snp files from the left sidebar to start",
+            "👈 Browse .snp files from the sidebar, or drop files anywhere on the page",
             style={"padding": "40px", "textAlign": "center", "color": "#6c757d",
-                   "backgroundColor": "#f8f9fa", "borderRadius": "8px",
-                   "border": "2px dashed #dee2e6"},
+                   "backgroundColor": "#f8f9fa", "font-size": "15px", 
+                   "borderRadius": "8px", "border": "2px dashed #dee2e6"},
         ), {}, 0, {}, []
 
     if not param or not data_type:
@@ -1655,6 +1933,20 @@ def update_main(
             "show_in_legend": bool(t_shows[i]) if i < len(t_shows) else True,
         })
 
+    # 組裝 smith_markers_list
+    is_smith = data_type == "smith"
+    sm_store_ids = list((smith_marker_store or {}).keys())
+    smith_markers_list = []
+    for i, freq_val in enumerate(sm_freqs):
+        if freq_val is None:
+            continue
+        sm_id_str = sm_store_ids[i] if i < len(sm_store_ids) else str(i + 1)
+        smith_markers_list.append({
+            "freq":  freq_val,
+            "label": f"M{sm_id_str}: {freq_val:.3f} {unit}",
+            "color": sm_colors[i] if i < len(sm_colors) and sm_colors[i] else DEFAULT_MARKER_COLORS[i % 10],
+        })
+
     # 只畫主曲線 + threshold
     fig, threshold_crossings, base_trace_count, threshold_shape_map = build_base_figure(
         files_data=parsed_files,
@@ -1665,30 +1957,40 @@ def update_main(
         amp_range=(amp_min, amp_max),
         threshold_markers_list=threshold_markers_list,
         line_width=line_width,
-        num_markers=len(markers_list),
+        num_markers=len(markers_list) if not is_smith else len(smith_markers_list),
     )
 
     # threshold annotations 在 marker overlay 加入前提取（純 threshold 標籤）
     threshold_annotations_json = [ann.to_plotly_json() for ann in fig.layout.annotations]
 
     # 加上 marker overlay（在此也畫一次，保持初始狀態正確）
-    overlay_traces, shapes, annotations, marker_values, shape_index_map = compute_marker_overlay(
-        files_data=parsed_files,
-        visible_filenames=visible_filenames,
-        selected_param=param,
-        selected_data_type=data_type,
-        markers_list=markers_list,
-    )
-    for trace in overlay_traces:
-        fig.add_trace(trace)
-    for shape in shapes:
-        fig.add_shape(**shape)
-    for ann in annotations:
-        fig.add_annotation(**ann)
+    if is_smith:
+        smith_overlay_traces, smith_marker_values = build_smith_marker_overlays(
+            files_data=parsed_files,
+            visible_filenames=visible_filenames,
+            selected_param=param,
+            smith_markers_list=smith_markers_list,
+        )
+        for trace in smith_overlay_traces:
+            fig.add_trace(trace)
+        overlay_traces, shapes, annotations, marker_values, shape_index_map = [], [], [], smith_marker_values, {}
+    else:
+        overlay_traces, shapes, annotations, marker_values, shape_index_map = compute_marker_overlay(
+            files_data=parsed_files,
+            visible_filenames=visible_filenames,
+            selected_param=param,
+            selected_data_type=data_type,
+            markers_list=markers_list,
+        )
+        for trace in overlay_traces:
+            fig.add_trace(trace)
+        for shape in shapes:
+            fig.add_shape(**shape)
+        for ann in annotations:
+            fig.add_annotation(**ann)
 
     selected_param_full = f"{param}_{data_type}"
     y_axis_unit_str = get_y_axis_unit(data_type)
-    is_smith = data_type == "smith"
     n_thresh = len(threshold_shape_map)
     shape_index_map_str = {str(int(k) + n_thresh): v for k, v in shape_index_map.items()}
     threshold_shape_map_str = {str(k): v for k, v in threshold_shape_map.items()}
@@ -1718,19 +2020,29 @@ def update_main(
 
     # 表格區塊放在 id="tables-area" 讓 overlay callback 可以單獨更新
     tables_children = []
-    if markers_list and marker_values:
-        marker_df = build_marker_table(marker_values, visible_filenames, unit, y_axis_unit_str)
-        tables_children += [
-            html.H3("📊 Marker Values Overview", style={"fontSize": "16px", "marginTop": "20px"}),
-            df_to_dash_table(marker_df, "table-markers"),
-        ]
-    if threshold_markers_list and threshold_crossings:
-        thresh_df = build_threshold_table(threshold_crossings, visible_filenames, unit)
-        tables_children += [
-            html.H3("📐 Threshold Crossing Frequencies", style={"fontSize": "16px", "marginTop": "20px"}),
-            df_to_dash_table(thresh_df, "table-thresholds"),
-        ]
-    if not is_smith:
+    if is_smith:
+        if smith_markers_list and marker_values:
+            first_df = list(parsed_files.values())[0]["df"]
+            _, freq_unit_str, _ = auto_convert_frequency(first_df, return_unit_factor=True)
+            smith_df = build_smith_marker_table(marker_values, visible_filenames, freq_unit_str)
+            if not smith_df.empty:
+                tables_children += [
+                    html.H3("📊 Smith Marker Values", style={"fontSize": "16px", "marginTop": "20px"}),
+                    df_to_dash_table(smith_df, "table-smith-markers"),
+                ]
+    else:
+        if markers_list and marker_values:
+            marker_df = build_marker_table(marker_values, visible_filenames, unit, y_axis_unit_str)
+            tables_children += [
+                html.H3("📊 Marker Values Overview", style={"fontSize": "16px", "marginTop": "20px"}),
+                df_to_dash_table(marker_df, "table-markers"),
+            ]
+        if threshold_markers_list and threshold_crossings:
+            thresh_df = build_threshold_table(threshold_crossings, visible_filenames, unit)
+            tables_children += [
+                html.H3("📐 Threshold Crossing Frequencies", style={"fontSize": "16px", "marginTop": "20px"}),
+                df_to_dash_table(thresh_df, "table-thresholds"),
+            ]
         stats_df = build_stats_table(parsed_files, visible_filenames, selected_param_full, (fmin, fmax))
         if not stats_df.empty:
             tables_children += [
@@ -1865,6 +2177,9 @@ def sync_marker_from_drag(
     Input({"type": "marker-color",       "index": ALL}, "value"),
     Input({"type": "marker-show-legend", "index": ALL}, "value"),
     Input("num-markers", "data"),
+    Input({"type": "smith-marker-freq",  "index": ALL}, "value"),
+    Input({"type": "smith-marker-color", "index": ALL}, "value"),
+    Input("num-smith-markers", "data"),
     State("store-files-data", "data"),
     State("dd-param", "value"),
     State("dd-datatype", "value"),
@@ -1883,6 +2198,8 @@ def sync_marker_from_drag(
 def update_marker_overlay(
     m_freqs, m_colors, m_shows,
     marker_store,
+    sm_freqs, sm_colors,
+    smith_marker_store,
     files_data, param, data_type,
     visible_filenames, base_trace_count,
     freq_meta, fmin, fmax,
@@ -1963,18 +2280,60 @@ def update_marker_overlay(
         xref="paper", yref="paper",
         line=dict(color="rgba(0,0,0,0)", width=0), opacity=0,
     )
+    _empty_scatter      = {"type": "scatter",      "x": [],    "y": [],    "showlegend": False, "hoverinfo": "skip"}
+    _empty_scattersmith = {"type": "scattersmith",  "real": [], "imag": [], "showlegend": False, "hoverinfo": "skip"}
     patched_fig = Patch()
 
+    # ── Smith Chart 路徑 ──────────────────────────────────
+    if is_smith:
+        sm_store_ids = list((smith_marker_store or {}).keys())
+        smith_markers_list = []
+        for i, freq_val in enumerate(sm_freqs or []):
+            if freq_val is None:
+                continue
+            sm_id_str = sm_store_ids[i] if i < len(sm_store_ids) else str(i + 1)
+            smith_markers_list.append({
+                "freq":  freq_val,
+                "label": f"M{sm_id_str}: {freq_val:.3f} {unit}",
+                "color": sm_colors[i] if i < len(sm_colors) and sm_colors[i] else DEFAULT_MARKER_COLORS[i % 10],
+            })
+
+        for i in range(50):
+            patched_fig["data"][base_trace_count + i] = _empty_scattersmith
+
+        if not smith_markers_list:
+            return patched_fig, [], {}
+
+        overlay_traces, marker_values = build_smith_marker_overlays(
+            files_data=parsed_files,
+            visible_filenames=visible_filenames,
+            selected_param=param,
+            smith_markers_list=smith_markers_list,
+        )
+        for i, trace in enumerate(overlay_traces):
+            patched_fig["data"][base_trace_count + i] = trace.to_plotly_json()
+
+        tables_children = []
+        if marker_values:
+            _, freq_unit_str, _ = auto_convert_frequency(
+                list(parsed_files.values())[0]["df"], return_unit_factor=True
+            )
+            smith_df = build_smith_marker_table(marker_values, visible_filenames, freq_unit_str)
+            if not smith_df.empty:
+                tables_children = [
+                    html.H3("📊 Smith Marker Values", style={"fontSize": "16px", "marginTop": "20px"}),
+                    df_to_dash_table(smith_df, "table-smith-markers"),
+                ]
+        return patched_fig, tables_children, {}
+
+    # ── 非 Smith 路徑 ─────────────────────────────────────
     # marker 全部清空時：清除 marker shapes 和 overlay traces，保留 threshold annotations
     if not m_freqs or not marker_store:
         patched_fig["layout"]["annotations"] = list(threshold_annotations_stored)
         for i in range(50):
             patched_fig["layout"]["shapes"][n_threshold_shapes + i] = _invisible_shape
         for i in range(50):
-            patched_fig["data"][base_trace_count + i] = {
-                "type": "scatter", "x": [], "y": [],
-                "showlegend": False, "hoverinfo": "skip",
-            }
+            patched_fig["data"][base_trace_count + i] = _empty_scatter
         return patched_fig, static_tables, {}
 
     store_ids = list(marker_store.keys())
@@ -2009,15 +2368,11 @@ def update_marker_overlay(
     for i in range(len(shapes), 50):
         patched_fig["layout"]["shapes"][n_threshold_shapes + i] = _invisible_shape
 
-    # threshold annotations 保留 + marker annotations 附加
     patched_fig["layout"]["annotations"] = list(threshold_annotations_stored) + list(annotations)
 
     new_data = [t.to_plotly_json() for t in overlay_traces]
     for i in range(50):
-        patched_fig["data"][base_trace_count + i] = {
-            "type": "scatter", "x": [], "y": [],
-            "showlegend": False, "hoverinfo": "skip",
-        }
+        patched_fig["data"][base_trace_count + i] = _empty_scatter
     for i, trace_json in enumerate(new_data):
         patched_fig["data"][base_trace_count + i] = trace_json
 
