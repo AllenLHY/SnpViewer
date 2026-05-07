@@ -45,8 +45,15 @@ warnings.filterwarnings("ignore", message=".*keyword arguments have been depreca
 # ============================================================
 # Version
 # ============================================================
-APP_VERSION = "1.0.3"
+APP_VERSION = "1.0.4"
 
+# v1.0.4  2026-05-07
+#   - feat: Smith marker click-to-set — click on Smith curve to move a marker
+#   - feat: 🎯 toggle button per Smith marker (click-to-set target); default moves last marker
+#   - ui: 🎯 button enlarged (22px), hover scale + blue glow effect
+#   - ui: del buttons (all 3 marker types) hover effect — red darken + scale
+#   - fix: 🎯 button focus outline removed (black border on deactivate)
+#
 # v1.0.3  2026-05-07
 #   - feat: Smith marker table redesigned — columns: Marker / File / Freq / Z₀(Ω) / Γ / Z(Ω) / Y(mS)
 #   - feat: Γ, Z, Y displayed as complex strings "a ± jb" (2 decimal places)
@@ -808,6 +815,7 @@ app.layout = html.Div([
     dcc.Store(id="store-threshold-annotations",  storage_type="memory", data=[]),
     dcc.Store(id="store-upload-queue",           storage_type="memory", data=None),
     dcc.Store(id="store-setup-done",             data=0),
+    dcc.Store(id="store-active-smith-marker",    storage_type="memory", data=None),
     dcc.Interval(id="interval-upload-check", interval=300, n_intervals=0),
 
     # ── 頁面主體 ──────────────────────────────────────────────
@@ -1477,6 +1485,7 @@ def render_marker_inputs(store, freq_meta):
                     id={"type": "marker-del-btn", "index": m_id},
                     n_clicks=0,
                     title=f"Delete Marker {m_id}",
+                    className="del-circle-btn",
                     style={
                         "marginLeft": "6px",
                         "width": "20px", "height": "20px",
@@ -1554,6 +1563,7 @@ def render_threshold_inputs(store, data_type):
                     id={"type": "threshold-del-btn", "index": t_id},
                     n_clicks=0,
                     title=f"Delete Threshold {t_id}",
+                    className="del-circle-btn",
                     style={
                         "marginLeft": "6px",
                         "width": "20px", "height": "20px",
@@ -1685,31 +1695,45 @@ def set_threshold_peak_dip(
     Output("smith-markers-container", "children"),
     Input("num-smith-markers", "data"),
     State("store-freq-meta", "data"),
+    State("store-active-smith-marker", "data"),
 )
-def render_smith_marker_inputs(store, freq_meta):
+def render_smith_marker_inputs(store, freq_meta, active_id):
     if not store or not freq_meta:
         return []
     unit = freq_meta.get("unit", "GHz")
     children = []
     for pos, (m_id_str, freq_val) in enumerate(store.items()):
         m_id = int(m_id_str)
-        del_btn_style = {
-            "marginLeft": "6px",
-            "width": "20px", "height": "20px",
-            "border": "1px solid #f5c6cb",
+        _btn_base = {
+            "width": "22px", "height": "22px",
+            "border": "1px solid #ced4da",
             "borderRadius": "50%",
-            "backgroundColor": "#fff0f0",
-            "color": "#c0392b",
             "cursor": "pointer",
             "fontSize": "13px",
             "lineHeight": "1",
             "padding": "0",
-            "fontWeight": "700",
             "display": "inline-flex",
             "alignItems": "center",
             "justifyContent": "center",
             "verticalAlign": "middle",
             "flexShrink": "0",
+        }
+        del_btn_style = {
+            **_btn_base,
+            "marginLeft": "4px",
+            "border": "1px solid #f5c6cb",
+            "backgroundColor": "#fff0f0",
+            "color": "#c0392b",
+            "fontWeight": "700",
+        }
+        is_active = (active_id == m_id)
+        aim_btn_style = {
+            **_btn_base,
+            "marginLeft": "4px",
+            "backgroundColor": "#cce5ff" if is_active else "#f8f9fa",
+            "borderColor":     "#66b2ff" if is_active else "#ced4da",
+            "color":           "#004085" if is_active else "#6c757d",
+            "outline":         "none",
         }
         summary = html.Summary(
             html.Div([
@@ -1726,10 +1750,19 @@ def render_smith_marker_inputs(store, freq_meta):
                 html.Span(f" {unit}", style={"fontSize": "12px", "color": "#6c757d",
                                              "flexShrink": "0", "marginLeft": "2px"}),
                 html.Button(
+                    "🎯",
+                    id={"type": "smith-marker-aim-btn", "index": m_id},
+                    n_clicks=0,
+                    title="Click chart to move this marker",
+                    className="smith-aim-btn",
+                    style=aim_btn_style,
+                ),
+                html.Button(
                     "×",
                     id={"type": "smith-marker-del-btn", "index": m_id},
                     n_clicks=0,
                     title=f"Delete Smith Marker {m_id}",
+                    className="del-circle-btn",
                     style=del_btn_style,
                 ),
             ], style={"display": "flex", "alignItems": "center", "width": "100%"}),
@@ -1746,6 +1779,124 @@ def render_smith_marker_inputs(store, freq_meta):
             style={"borderBottom": "1px solid #eee", "paddingBottom": "4px", "marginBottom": "2px"},
         ))
     return children
+
+
+# ── 8c. 🎯 toggle → store-active-smith-marker ────────────
+@callback(
+    Output("store-active-smith-marker", "data"),
+    Input({"type": "smith-marker-aim-btn", "index": ALL}, "n_clicks"),
+    State("store-active-smith-marker", "data"),
+    prevent_initial_call=True,
+)
+def toggle_active_smith_marker(aim_clicks, current_active):
+    if not any(c for c in aim_clicks if c):
+        raise PreventUpdate
+    tid = ctx.triggered_id
+    if not isinstance(tid, dict):
+        raise PreventUpdate
+    clicked_id = tid["index"]
+    return None if current_active == clicked_id else clicked_id
+
+
+# ── 8d. 🎯 按鈕樣式同步 active 狀態 ──────────────────────
+@callback(
+    Output({"type": "smith-marker-aim-btn", "index": ALL}, "style"),
+    Input("store-active-smith-marker", "data"),
+    State({"type": "smith-marker-aim-btn", "index": ALL}, "id"),
+)
+def update_aim_btn_styles(active_id, btn_ids):
+    _base = {
+        "width": "22px", "height": "22px",
+        "borderRadius": "50%",
+        "cursor": "pointer",
+        "fontSize": "13px",
+        "lineHeight": "1",
+        "padding": "0",
+        "marginLeft": "4px",
+        "display": "inline-flex",
+        "alignItems": "center",
+        "justifyContent": "center",
+        "verticalAlign": "middle",
+        "flexShrink": "0",
+    }
+    styles = []
+    for btn_id in (btn_ids or []):
+        is_active = btn_id["index"] == active_id
+        styles.append({
+            **_base,
+            "border":           "1px solid #66b2ff" if is_active else "1px solid #ced4da",
+            "backgroundColor":  "#cce5ff"           if is_active else "#f8f9fa",
+            "color":            "#004085"            if is_active else "#6c757d",
+            "outline":          "none",
+        })
+    return styles
+
+
+# ── 8e. Smith marker 刪除時若刪的是 active，清除 store ───
+@callback(
+    Output("store-active-smith-marker", "data", allow_duplicate=True),
+    Input({"type": "smith-marker-del-btn", "index": ALL}, "n_clicks"),
+    Input("btn-smith-marker-dec", "n_clicks"),
+    State("store-active-smith-marker", "data"),
+    State("num-smith-markers", "data"),
+    prevent_initial_call=True,
+)
+def clear_active_on_delete(del_clicks, dec_click, active_id, smith_store):
+    if active_id is None:
+        raise PreventUpdate
+    tid = ctx.triggered_id
+    store_ids = list((smith_store or {}).keys())
+
+    if isinstance(tid, dict) and tid.get("type") == "smith-marker-del-btn":
+        if tid["index"] == active_id:
+            return None
+    elif tid == "btn-smith-marker-dec":
+        # dec 刪除最後一個 marker
+        if store_ids and int(store_ids[-1]) == active_id:
+            return None
+    raise PreventUpdate
+
+
+# ── 8f. 點擊 Smith 圖曲線 → 移動 target marker ──────────
+@callback(
+    Output({"type": "smith-marker-freq", "index": ALL}, "value"),
+    Input("main-graph", "clickData"),
+    State("store-active-smith-marker", "data"),
+    State("num-smith-markers", "data"),
+    State({"type": "smith-marker-freq", "index": ALL}, "value"),
+    State("dd-datatype", "value"),
+    prevent_initial_call=True,
+)
+def smith_click_to_set(click_data, active_id, smith_store, current_freqs, data_type):
+    if not click_data or data_type != "smith":
+        raise PreventUpdate
+
+    points = click_data.get("points", [])
+    if not points:
+        raise PreventUpdate
+
+    # customdata 是純 float → 主曲線；是 list → marker dot，忽略
+    freq_val = points[0].get("customdata")
+    if not isinstance(freq_val, (int, float)):
+        raise PreventUpdate
+
+    store_ids = list((smith_store or {}).keys())
+    if not store_ids:
+        raise PreventUpdate
+
+    # 決定要移動哪個 marker
+    if active_id is not None and str(active_id) in store_ids:
+        target_id = active_id
+    else:
+        target_id = int(store_ids[-1])
+
+    new_freqs = list(current_freqs)
+    for i, item in enumerate(ctx.states_list[2]):   # smith-marker-freq ALL
+        if item["id"]["index"] == target_id:
+            new_freqs[i] = round(float(freq_val), 4)
+            break
+
+    return new_freqs
 
 
 # ── 9. 檔案勾選清單 ──────────────────────────────────────

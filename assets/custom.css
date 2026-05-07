@@ -48,3 +48,33 @@ details[open] > summary::before {
     background-color: #f0f0f0 !important;
     border-color: #adb5bd !important;
 }
+
+.smith-aim-btn {
+    transition: transform 0.15s ease, box-shadow 0.15s ease,
+                background-color 0.15s ease, border-color 0.15s ease;
+}
+
+.smith-aim-btn:focus,
+.smith-aim-btn:focus-visible {
+    outline: none !important;
+    box-shadow: none;
+}
+
+.smith-aim-btn:hover {
+    transform: scale(1.18);
+    box-shadow: 0 0 0 3px rgba(102, 178, 255, 0.35);
+}
+
+.del-circle-btn {
+    transition: transform 0.15s ease, background-color 0.15s ease, border-color 0.15s ease;
+}
+
+.del-circle-btn:focus {
+    outline: none;
+}
+
+.del-circle-btn:hover {
+    background-color: #f1948a !important;
+    border-color: #e74c3c !important;
+    transform: scale(1.15);
+}
