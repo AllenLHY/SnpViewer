@@ -45,8 +45,14 @@ warnings.filterwarnings("ignore", message=".*keyword arguments have been depreca
 # ============================================================
 # Version
 # ============================================================
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.0.3"
 
+# v1.0.3  2026-05-07
+#   - feat: Smith marker table redesigned — columns: Marker / File / Freq / Z₀(Ω) / Γ / Z(Ω) / Y(mS)
+#   - feat: Γ, Z, Y displayed as complex strings "a ± jb" (2 decimal places)
+#   - feat: Z₀ read from SNP file header (network.z0); fallback to 50 Ω
+#   - feat: hover tooltip updated to show Z₀, Γ, Z, Y in complex format
+#
 # v1.0.2  2026-05-06
 #   - feat: threshold Peak / -3 dB / Dip preset buttons
 #   - fix: param type switch now preserves data type selection
