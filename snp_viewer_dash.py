@@ -45,7 +45,7 @@ warnings.filterwarnings("ignore", message=".*keyword arguments have been depreca
 # ============================================================
 # Version
 # ============================================================
-APP_VERSION = "1.0.4"
+APP_VERSION = "1.1.0"
 
 # v1.0.4  2026-05-07
 #   - feat: Smith marker click-to-set — click on Smith curve to move a marker
@@ -405,7 +405,7 @@ def build_base_figure(
             height=600,
             showlegend=True,
             legend=legend_style,
-            margin=dict(t=80, b=80, l=80, r=150),
+            margin=dict(t=40, b=40, l=80, r=150),
         )
     else:
         y_title = f"{selected_param_full} ({y_axis_unit})" if y_axis_unit else selected_param_full
@@ -423,7 +423,7 @@ def build_base_figure(
             height=600,
             showlegend=True,
             legend=legend_style,
-            margin=dict(t=80, b=80, l=80, r=150),
+            margin=dict(t=40, b=40, l=80, r=150),
             xaxis=dict(showgrid=True, gridcolor="rgba(200,200,200,0.3)", gridwidth=1),
             yaxis=dict(
                 showgrid=True,
@@ -740,6 +740,116 @@ def df_to_dash_table(df: pd.DataFrame, table_id: str):
 
 
 # ============================================================
+# Callback shared helpers
+# ============================================================
+
+def _parse_files(files_data: dict) -> dict:
+    return {
+        fn: {"df": pd.read_json(io.StringIO(fdata["df_json"]), orient="split", convert_dates=False)}
+        for fn, fdata in files_data.items()
+    }
+
+
+def _build_markers_list(m_freqs, m_colors, m_shows, store, unit: str) -> list:
+    store_ids = list((store or {}).keys())
+    result = []
+    for i, freq_val in enumerate(m_freqs or []):
+        if freq_val is None:
+            continue
+        m_id_str = store_ids[i] if i < len(store_ids) else str(i + 1)
+        result.append({
+            "freq":           freq_val,
+            "label":          f"M{m_id_str}: {freq_val:.3f} {unit}",
+            "color":          m_colors[i] if i < len(m_colors) and m_colors[i] else DEFAULT_MARKER_COLORS[i % 10],
+            "style":          "vertical",
+            "show_in_legend": bool(m_shows[i]) if m_shows and i < len(m_shows) else True,
+        })
+    return result
+
+
+def _build_threshold_markers_list(t_values, t_colors, t_shows, store, y_unit: str) -> list:
+    store_ids = list((store or {}).keys())
+    result = []
+    for i, t_val in enumerate(t_values or []):
+        if t_val is None:
+            continue
+        t_id_str = store_ids[i] if i < len(store_ids) else str(i + 1)
+        result.append({
+            "value":          t_val,
+            "label":          f"T{t_id_str}: {t_val:.1f} {y_unit}",
+            "id_str":         t_id_str,
+            "color":          t_colors[i] if i < len(t_colors) and t_colors[i] else DEFAULT_MARKER_COLORS[i % 10],
+            "show_in_legend": bool(t_shows[i]) if t_shows and i < len(t_shows) else True,
+        })
+    return result
+
+
+def _build_smith_markers_list(sm_freqs, sm_colors, store, unit: str) -> list:
+    store_ids = list((store or {}).keys())
+    result = []
+    for i, freq_val in enumerate(sm_freqs or []):
+        if freq_val is None:
+            continue
+        sm_id_str = store_ids[i] if i < len(store_ids) else str(i + 1)
+        result.append({
+            "freq":  freq_val,
+            "label": f"M{sm_id_str}: {freq_val:.3f} {unit}",
+            "color": sm_colors[i] if i < len(sm_colors) and sm_colors[i] else DEFAULT_MARKER_COLORS[i % 10],
+        })
+    return result
+
+
+def _compute_threshold_crossings(
+    threshold_markers_list: list,
+    parsed_files: dict,
+    selected_param_full: str,
+    fmin: float,
+    fmax: float,
+) -> dict:
+    crossings: dict = {}
+    for t_marker in threshold_markers_list:
+        t_label = t_marker["label"]
+        crossings[t_label] = {}
+        for fname, finfo in parsed_files.items():
+            df_conv, _ = auto_convert_frequency(finfo["df"])
+            if selected_param_full not in df_conv.columns:
+                continue
+            df_filt = filter_by_frequency_range(df_conv, fmin, fmax)
+            crossings[t_label][get_display_name(fname)] = find_threshold_crossings(
+                df_filt, selected_param_full, t_marker["value"]
+            )
+    return crossings
+
+
+def _build_static_tables(
+    threshold_markers_list: list,
+    threshold_crossings: dict,
+    parsed_files: dict,
+    visible_filenames: list,
+    selected_param_full: str,
+    fmin: float,
+    fmax: float,
+    unit: str,
+    is_smith: bool,
+) -> list:
+    tables = []
+    if threshold_markers_list and threshold_crossings:
+        thresh_df = build_threshold_table(threshold_crossings, visible_filenames, unit)
+        tables += [
+            html.H3("📐 Threshold Crossing Frequencies", style={"fontSize": "16px", "marginTop": "20px"}),
+            df_to_dash_table(thresh_df, "table-thresholds"),
+        ]
+    if not is_smith:
+        stats_df = build_stats_table(parsed_files, visible_filenames, selected_param_full, (fmin, fmax))
+        if not stats_df.empty:
+            tables += [
+                html.H3("📊 Data Statistics", style={"fontSize": "16px", "marginTop": "20px"}),
+                df_to_dash_table(stats_df, "table-stats"),
+            ]
+    return tables
+
+
+# ============================================================
 # Layout
 # ============================================================
 
@@ -794,6 +904,24 @@ INPUT_STYLE = {
     "fontSize": "13px",
 }
 
+BTN_LAYOUT_ACTIVE = {
+    "padding": "4px 10px", "border": "1px solid #495057",
+    "borderRadius": "4px", "backgroundColor": "#495057", "color": "white",
+    "cursor": "pointer", "fontSize": "12px", "fontWeight": "600",
+}
+BTN_LAYOUT_INACTIVE = {
+    "padding": "4px 10px", "border": "1px solid #ced4da",
+    "borderRadius": "4px", "backgroundColor": "#fff", "color": "#495057",
+    "cursor": "pointer", "fontSize": "12px",
+}
+
+LAYOUT_GRID = {
+    "1x1": {"cols": 1, "rows": 1, "cells": 1, "graph_height": 580},
+    "1x2": {"cols": 2, "rows": 1, "cells": 2, "graph_height": 540},
+    "2x1": {"cols": 1, "rows": 2, "cells": 2, "graph_height": 340},
+    "2x2": {"cols": 2, "rows": 2, "cells": 4, "graph_height": 340},
+}
+
 def label(text):
     return html.Label(text, style={"fontSize": "12px", "color": "#6c757d", "marginBottom": "2px", "display": "block"})
 
@@ -808,10 +936,17 @@ app.layout = html.Div([
     dcc.Store(id="store-markers",         storage_type="memory", data=[]),
     dcc.Store(id="store-thresholds",      storage_type="memory", data=[]),
     dcc.Store(id="store-resize-init",     data=1),
+    dcc.Store(id="store-layout",             storage_type="memory", data="1x1"),
+    dcc.Store(id="store-graph-height",       storage_type="memory", data=None),
+    dcc.Store(id="store-cell-configs",       storage_type="memory", data=[
+        {"param": None, "data_type": None},
+        {"param": None, "data_type": None},
+        {"param": None, "data_type": None},
+    ]),
     dcc.Store(id="store-shape-index-map",           storage_type="memory", data={}),
     dcc.Store(id="store-threshold-shape-map",       storage_type="memory", data={}),
     dcc.Store(id="store-visible-files",   storage_type="memory", data=[]),
-    dcc.Store(id="store-base-trace-count",       storage_type="memory", data=0),
+    dcc.Store(id="store-base-trace-count",       storage_type="memory", data=[0, 0, 0, 0]),
     dcc.Store(id="store-threshold-annotations",  storage_type="memory", data=[]),
     dcc.Store(id="store-upload-queue",           storage_type="memory", data=None),
     dcc.Store(id="store-setup-done",             data=0),
@@ -1010,14 +1145,34 @@ app.layout = html.Div([
         html.Div([
             html.H1(f"📊 S-parameter Viewer  [v{APP_VERSION}]", style={"fontSize": "32px", "marginBottom": "4px", "marginTop": 0}),
             html.P("Upload multiple .snp files (.s1p, .s2p, .s4p, etc.) for plotting comparison and analysis",
-                   style={"color": "#6c757d", "fontSize": "14px", "marginBottom": "16px"}),
+                   style={"color": "#6c757d", "fontSize": "14px", "marginBottom": "8px"}),
 
-            html.Div(id="main-content", children=[
-                html.Div("Drop .snp files anywhere on the page, or browse from the sidebar",
-                         style={"padding": "40px", "textAlign": "center", "color": "#6c757d",
-                                "backgroundColor": "#f8f9fa", "borderRadius": "8px",
-                                "border": "2px dashed #dee2e6"})
+            html.Div([
+                html.Span("Layout:", style={"fontSize": "13px", "color": "#6c757d",
+                                            "alignSelf": "center", "marginRight": "8px"}),
+                *[html.Button(lbl, id={"type": "layout-btn", "index": mode}, n_clicks=0,
+                              style=BTN_LAYOUT_ACTIVE if mode == "1x1" else BTN_LAYOUT_INACTIVE)
+                  for mode, lbl in [("1x1", "1×1"), ("1x2", "1×2"), ("2x1", "2×1"), ("2x2", "2×2")]],
+            ], style={"display": "flex", "gap": "4px", "alignItems": "center", "marginBottom": "12px"}),
+
+            html.Div(id="plot-section", style={"overflow": "hidden", "paddingBottom": "10px"}, children=[
+                html.Div(id="main-content", children=[
+                    html.Div("Drop .snp files anywhere on the page, or browse from the sidebar",
+                             style={"padding": "40px", "textAlign": "center", "color": "#6c757d",
+                                    "backgroundColor": "#f8f9fa", "borderRadius": "8px",
+                                    "border": "2px dashed #dee2e6"})
+                ]),
             ]),
+            html.Div(
+                html.Div(style={"width": "48px", "height": "4px", "borderRadius": "2px",
+                                "backgroundColor": "#ced4da", "margin": "0 auto"}),
+                id="plot-table-gutter",
+                style={"height": "14px", "cursor": "row-resize", "display": "flex",
+                       "alignItems": "center", "margin": "4px 0", "userSelect": "none"},
+            ),
+            html.Div(id="tables-area"),
+            html.Div(id="resize-trigger-dummy", style={"display": "none"}),
+            html.Div(id="drag-gutter-inited",   style={"display": "none"}),
 
             html.Hr(style={"margin": "24px 0"}),
             html.P("💡 Tip: Upload .snp files, select parameters, and use markers for precise frequency analysis.",
@@ -1860,15 +2015,38 @@ def clear_active_on_delete(del_clicks, dec_click, active_id, smith_store):
 # ── 8f. 點擊 Smith 圖曲線 → 移動 target marker ──────────
 @callback(
     Output({"type": "smith-marker-freq", "index": ALL}, "value"),
-    Input("main-graph", "clickData"),
+    Input({"type": "cell-graph", "index": ALL}, "clickData"),
     State("store-active-smith-marker", "data"),
     State("num-smith-markers", "data"),
     State({"type": "smith-marker-freq", "index": ALL}, "value"),
     State("dd-datatype", "value"),
+    State("store-cell-configs", "data"),
     prevent_initial_call=True,
 )
-def smith_click_to_set(click_data, active_id, smith_store, current_freqs, data_type):
-    if not click_data or data_type != "smith":
+def smith_click_to_set(click_data_list, active_id, smith_store, current_freqs, data_type_c0, cell_configs):
+    triggered = ctx.triggered_id
+    if not triggered or not isinstance(triggered, dict):
+        raise PreventUpdate
+
+    triggered_cell = triggered["index"]
+    click_data = None
+    for i, item in enumerate(ctx.inputs_list[0]):
+        if item["id"]["index"] == triggered_cell:
+            click_data = click_data_list[i]
+            break
+
+    if not click_data:
+        raise PreventUpdate
+
+    # Determine this cell's data_type
+    if triggered_cell == 0:
+        cell_dt = data_type_c0
+    else:
+        cell_configs = cell_configs or []
+        cfg = cell_configs[triggered_cell - 1] if triggered_cell - 1 < len(cell_configs) else {}
+        cell_dt = cfg.get("data_type") or data_type_c0
+
+    if cell_dt != "smith":
         raise PreventUpdate
 
     points = click_data.get("points", [])
@@ -1989,15 +2167,242 @@ app.clientside_callback(
 )
 
 
+# ── 10d. main-content 更新後觸發 Plotly resize（修正 CSS grid 欄寬時序問題）─
+app.clientside_callback(
+    """
+    function(children) {
+        setTimeout(function() { window.dispatchEvent(new Event('resize')); }, 50);
+        return window.dash_clientside.no_update;
+    }
+    """,
+    Output("resize-trigger-dummy", "children"),
+    Input("main-content", "children"),
+)
+
+
+# ── 10e. 根據視窗高度動態計算 graph_height ─────────────────
+app.clientside_callback(
+    """
+    function(layout) {
+        var sec = document.getElementById('plot-section');
+        if (sec) sec.style.height = '';
+        var nRows = (layout === '2x1' || layout === '2x2') ? 2 : 1;
+        var chrome = 155;   // title + subtitle + layout bar + content padding
+        var perRow = 48;    // cell header + cell border padding per row
+        var gap    = 8;
+        var available = window.innerHeight - chrome - perRow * nRows - gap * (nRows - 1);
+        var h = Math.floor(available / nRows * 0.8);
+        h = Math.max(h, 200);
+        h = Math.min(h, 900);
+        return h;
+    }
+    """,
+    Output("store-graph-height", "data"),
+    Input("store-layout", "data"),
+)
+
+
+# ── 10f. plot / table 區分隔線拖拉 ───────────────────────
+app.clientside_callback(
+    """
+    function(children) {
+        var handle = document.getElementById('plot-table-gutter');
+        if (!handle) return window.dash_clientside.no_update;
+        if (handle._dragInited) return window.dash_clientside.no_update;
+        handle._dragInited = true;
+
+        var dragging    = false;
+        var startY      = 0;
+        var startH      = 0;
+        var lastGraphH  = 0;
+
+        handle.addEventListener('mousedown', function(e) {
+            dragging = true;
+            startY   = e.clientY;
+            var sec  = document.getElementById('plot-section');
+            startH   = sec ? sec.offsetHeight : 400;
+            e.preventDefault();
+            document.body.style.cursor    = 'row-resize';
+            document.body.style.userSelect = 'none';
+        });
+
+        document.addEventListener('mousemove', function(e) {
+            if (!dragging) return;
+            var sec  = document.getElementById('plot-section');
+            var grid = document.getElementById('cell-grid');
+            if (!sec || !grid) return;
+            var nRows  = parseInt(grid.getAttribute('data-rows')) || 1;
+            var newH   = Math.max(nRows * 150, startH + (e.clientY - startY));
+            sec.style.height = newH + 'px';
+
+            lastGraphH = Math.max(100, Math.floor((newH - 8 * (nRows - 1)) / nRows) - 48);
+            document.querySelectorAll('.graph-cell-container').forEach(function(c) {
+                c.style.height = lastGraphH + 'px';
+                var dg = c.querySelector('.dash-graph');
+                if (dg) dg.style.height = lastGraphH + 'px';
+            });
+            window.dispatchEvent(new Event('resize'));
+        });
+
+        document.addEventListener('mouseup', function() {
+            if (!dragging) return;
+            dragging = false;
+            document.body.style.cursor    = '';
+            document.body.style.userSelect = '';
+            if (lastGraphH > 0) window._pendingDragHeight = lastGraphH;
+        });
+
+        return window.dash_clientside.no_update;
+    }
+    """,
+    Output("drag-gutter-inited", "children"),
+    Input("main-content", "children"),
+)
+
+
+# ── 10g. mouseup 後把拖動高度寫回 store-graph-height ──────
+app.clientside_callback(
+    """
+    function(n) {
+        if (!window._pendingDragHeight) return window.dash_clientside.no_update;
+        var h = window._pendingDragHeight;
+        window._pendingDragHeight = null;
+        return h;
+    }
+    """,
+    Output("store-graph-height", "data", allow_duplicate=True),
+    Input("interval-upload-check", "n_intervals"),
+    prevent_initial_call=True,
+)
+
+
+# ── Layout 按鈕 → store-layout ───────────────────────────
+@callback(
+    Output("store-layout", "data"),
+    Input({"type": "layout-btn", "index": ALL}, "n_clicks"),
+    prevent_initial_call=True,
+)
+def set_layout(n_clicks_list):
+    if not ctx.triggered_id or not isinstance(ctx.triggered_id, dict):
+        raise PreventUpdate
+    return ctx.triggered_id["index"]
+
+
+@callback(
+    Output({"type": "layout-btn", "index": ALL}, "style"),
+    Input("store-layout", "data"),
+)
+def sync_layout_btn_styles(layout):
+    return [BTN_LAYOUT_ACTIVE if m == layout else BTN_LAYOUT_INACTIVE
+            for m in ["1x1", "1x2", "2x1", "2x2"]]
+
+
+# ── 初始化 / 更新 extra-cell configs ─────────────────────
+@callback(
+    Output("store-cell-configs", "data"),
+    Input("store-files-data", "data"),
+    Input("store-layout", "data"),
+    State("store-cell-configs", "data"),
+    prevent_initial_call=True,
+)
+def init_cell_configs(files_data, layout, current_configs):
+    current_configs = list(current_configs or [{"param": None, "data_type": None}] * 3)
+    if not files_data:
+        return [{"param": None, "data_type": None}] * 3
+    first_df = pd.read_json(
+        io.StringIO(list(files_data.values())[0]["df_json"]),
+        orient="split", convert_dates=False,
+    )
+    params = get_available_parameters(first_df)
+    if not params:
+        return [{"param": None, "data_type": None}] * 3
+    n_extra = {"1x1": 0, "1x2": 1, "2x1": 1, "2x2": 3}.get(layout, 0)
+    default_params = [params[min(1, len(params) - 1)], params[0], params[min(1, len(params) - 1)]]
+    default_dtypes = ["mag_db", "phase", "phase"]
+    result = []
+    for i in range(3):
+        if i >= n_extra:
+            result.append({"param": None, "data_type": None})
+            continue
+        cfg = current_configs[i] if i < len(current_configs) else {}
+        p = cfg.get("param")
+        dt = cfg.get("data_type")
+        if p not in params:
+            p = default_params[i]
+        dtypes = get_data_types(first_df, p)
+        if dt not in dtypes:
+            dt = default_dtypes[i] if default_dtypes[i] in dtypes else (dtypes[0] if dtypes else "mag_db")
+        result.append({"param": p, "data_type": dt})
+    if result == current_configs:
+        raise PreventUpdate
+    return result
+
+
+@callback(
+    Output("store-cell-configs", "data", allow_duplicate=True),
+    Output("dd-param", "value", allow_duplicate=True),
+    Output("dd-datatype", "value", allow_duplicate=True),
+    Input({"type": "cell-param", "index": ALL}, "value"),
+    Input({"type": "cell-datatype", "index": ALL}, "value"),
+    State("store-cell-configs", "data"),
+    prevent_initial_call=True,
+)
+def update_cell_configs(params, datatypes, current_configs):
+    if not ctx.triggered_id:
+        raise PreventUpdate
+    current_configs = list(current_configs or [{"param": None, "data_type": None}] * 3)
+    sidebar_param = no_update
+    sidebar_dtype = no_update
+    for i, param_item in enumerate(ctx.inputs_list[0]):
+        cell_index = param_item["id"]["index"]
+        dt_i = next((j for j, d in enumerate(ctx.inputs_list[1])
+                     if d["id"]["index"] == cell_index), i)
+        if cell_index == 0:
+            sidebar_param = params[i]
+            sidebar_dtype = datatypes[dt_i] if dt_i < len(datatypes) else no_update
+        else:
+            store_idx = cell_index - 1
+            if 0 <= store_idx < 3:
+                current_configs[store_idx] = {
+                    "param": params[i],
+                    "data_type": datatypes[dt_i] if dt_i < len(datatypes) else None,
+                }
+    return current_configs, sidebar_param, sidebar_dtype
+
+
+@callback(
+    Output({"type": "cell-datatype", "index": ALL}, "options"),
+    Output({"type": "cell-datatype", "index": ALL}, "value"),
+    Input({"type": "cell-param", "index": ALL}, "value"),
+    State("store-files-data", "data"),
+    State({"type": "cell-datatype", "index": ALL}, "value"),
+    prevent_initial_call=True,
+)
+def update_cell_datatype_opts(params, files_data, current_dtypes):
+    if not files_data:
+        return [[]] * len(params), [None] * len(params)
+    first_df = pd.read_json(
+        io.StringIO(list(files_data.values())[0]["df_json"]),
+        orient="split", convert_dates=False,
+    )
+    options_list, values_list = [], []
+    for i, param in enumerate(params):
+        dtypes = get_data_types(first_df, param) if param else []
+        options_list.append(dtypes)
+        cur = current_dtypes[i] if i < len(current_dtypes) else None
+        values_list.append(cur if cur in dtypes else (dtypes[0] if dtypes else None))
+    return options_list, values_list
+
+
 # ── 11. 主繪圖 callback（只在「曲線相關」參數變動時觸發）─
 # marker freq/label/color 改成 State，拖動 marker 不再觸發完整重畫
 @callback(
     Output("main-content", "children"),
+    Output("tables-area", "children"),
     Output("store-shape-index-map", "data"),
     Output("store-base-trace-count", "data"),
     Output("store-threshold-shape-map", "data"),
     Output("store-threshold-annotations", "data"),
-    # 曲線相關 Input（這些變動才重畫整張圖）
     Input("store-files-data", "data"),
     Input("dd-param", "value"),
     Input("dd-datatype", "value"),
@@ -2007,18 +2412,18 @@ app.clientside_callback(
     Input("amp-max", "value"),
     Input("line-width", "value"),
     Input("file-checklist", "value"),
-    # Threshold（變動需重畫）
     Input({"type": "threshold-value",       "index": ALL}, "value"),
     Input({"type": "threshold-color",       "index": ALL}, "value"),
     Input({"type": "threshold-show-legend", "index": ALL}, "value"),
-    # Marker 改成 State（拖動不觸發此 callback）
+    Input("store-layout", "data"),
+    Input("store-cell-configs", "data"),
+    Input("store-graph-height", "data"),
     State({"type": "marker-freq",        "index": ALL}, "value"),
     State({"type": "marker-color",       "index": ALL}, "value"),
     State({"type": "marker-show-legend", "index": ALL}, "value"),
     State("num-markers", "data"),
     State("num-thresholds", "data"),
     State("store-freq-meta", "data"),
-    # Smith Markers
     State({"type": "smith-marker-freq",  "index": ALL}, "value"),
     State({"type": "smith-marker-color", "index": ALL}, "value"),
     State("num-smith-markers", "data"),
@@ -2028,185 +2433,201 @@ def update_main(
     fmin, fmax, amp_min, amp_max,
     line_width, visible_filenames,
     t_values, t_colors, t_shows,
+    layout, cell_configs, graph_height_data,
     m_freqs, m_colors, m_shows,
     marker_store, threshold_store,
     freq_meta,
     sm_freqs, sm_colors, smith_marker_store,
 ):
     if not files_data:
-        return html.Div(
-            "👈 Browse .snp files from the sidebar, or drop files anywhere on the page",
-            style={"padding": "40px", "textAlign": "center", "color": "#6c757d",
-                   "backgroundColor": "#f8f9fa", "font-size": "15px", 
-                   "borderRadius": "8px", "border": "2px dashed #dee2e6"},
-        ), {}, 0, {}, []
-
+        return (
+            html.Div("👈 Browse .snp files from the sidebar, or drop files anywhere on the page",
+                     style={"padding": "40px", "textAlign": "center", "color": "#6c757d",
+                            "backgroundColor": "#f8f9fa", "font-size": "15px",
+                            "borderRadius": "8px", "border": "2px dashed #dee2e6"}),
+            [], {}, [0, 0, 0, 0], {}, [],
+        )
     if not param or not data_type:
         raise PreventUpdate
 
-    parsed_files = {}
-    for fn, fdata in files_data.items():
-        parsed_files[fn] = {"df": pd.read_json(io.StringIO(fdata["df_json"]), orient="split", convert_dates=False)}
-
+    parsed_files = _parse_files(files_data)
     visible_filenames = visible_filenames if visible_filenames else list(files_data.keys())
-    freq_meta = freq_meta or {}
-    unit = freq_meta.get("unit", "GHz")
-
-    fmin       = fmin       if fmin       is not None else freq_meta.get("disp_min", 0)
-    fmax       = fmax       if fmax       is not None else freq_meta.get("disp_max", 1)
-    amp_min    = amp_min    if amp_min    is not None else -100.0
-    amp_max    = amp_max    if amp_max    is not None else 0.0
+    freq_meta  = freq_meta or {}
+    unit       = freq_meta.get("unit", "GHz")
+    fmin       = fmin    if fmin    is not None else freq_meta.get("disp_min", 0)
+    fmax       = fmax    if fmax    is not None else freq_meta.get("disp_max", 1)
+    amp_min    = amp_min if amp_min is not None else -100.0
+    amp_max    = amp_max if amp_max is not None else 0.0
     line_width = line_width or 2
 
-    # 組裝 markers_list（從 State 讀）
-    store_ids = list((marker_store or {}).keys())
-    markers_list = []
-    for i, freq_val in enumerate(m_freqs):
-        if freq_val is None:
-            continue
-        m_id_str = store_ids[i] if i < len(store_ids) else str(i + 1)
-        markers_list.append({
-            "freq":           freq_val,
-            "label":          f"M{m_id_str}: {freq_val:.3f} {unit}",
-            "color":          m_colors[i] if i < len(m_colors) and m_colors[i] else DEFAULT_MARKER_COLORS[i % 10],
-            "style":          "vertical",
-            "show_in_legend": bool(m_shows[i]) if i < len(m_shows) else True,
-        })
+    y_unit             = get_y_axis_unit(data_type)
+    markers_list       = _build_markers_list(m_freqs, m_colors, m_shows, marker_store, unit)
+    threshold_markers_list = _build_threshold_markers_list(t_values, t_colors, t_shows, threshold_store, y_unit)
+    smith_markers_list = _build_smith_markers_list(sm_freqs, sm_colors, smith_marker_store, unit)
 
-    # 組裝 threshold_markers_list（label 自動由 dB 值生成）
-    threshold_markers_list = []
-    y_unit = get_y_axis_unit(data_type)
-    threshold_store = threshold_store or {}
-    t_store_ids = list(threshold_store.keys())
-    for i, t_val in enumerate(t_values):
-        if t_val is None:
-            continue
-        t_id_str = t_store_ids[i] if i < len(t_store_ids) else str(i + 1)
-        threshold_markers_list.append({
-            "value":          t_val,
-            "label":          f"T{t_id_str}: {t_val:.1f} {y_unit}",
-            "id_str":         t_id_str,
-            "color":          t_colors[i] if i < len(t_colors) and t_colors[i] else DEFAULT_MARKER_COLORS[i % 10],
-            "show_in_legend": bool(t_shows[i]) if i < len(t_shows) else True,
-        })
+    # Layout
+    layout_cfg   = LAYOUT_GRID.get(layout or "1x1", LAYOUT_GRID["1x1"])
+    n_cells      = layout_cfg["cells"]
+    n_cols       = layout_cfg["cols"]
+    n_rows       = layout_cfg["rows"]
+    graph_height = graph_height_data or layout_cfg["graph_height"]
 
-    # 組裝 smith_markers_list
-    is_smith = data_type == "smith"
-    sm_store_ids = list((smith_marker_store or {}).keys())
-    smith_markers_list = []
-    for i, freq_val in enumerate(sm_freqs):
-        if freq_val is None:
-            continue
-        sm_id_str = sm_store_ids[i] if i < len(sm_store_ids) else str(i + 1)
-        smith_markers_list.append({
-            "freq":  freq_val,
-            "label": f"M{sm_id_str}: {freq_val:.3f} {unit}",
-            "color": sm_colors[i] if i < len(sm_colors) and sm_colors[i] else DEFAULT_MARKER_COLORS[i % 10],
-        })
+    cell_configs = list(cell_configs or [])
+    all_cell_params  = [param]  + [
+        (cell_configs[i].get("param")      or param)      if i < len(cell_configs) else param
+        for i in range(3)
+    ]
+    all_cell_dtypes  = [data_type] + [
+        (cell_configs[i].get("data_type")  or data_type)  if i < len(cell_configs) else data_type
+        for i in range(3)
+    ]
 
-    # 只畫主曲線 + threshold
-    fig, threshold_crossings, base_trace_count, threshold_shape_map = build_base_figure(
-        files_data=parsed_files,
-        visible_filenames=visible_filenames,
-        selected_param=param,
-        selected_data_type=data_type,
-        freq_range=(fmin, fmax),
-        amp_range=(amp_min, amp_max),
-        threshold_markers_list=threshold_markers_list,
-        line_width=line_width,
-        num_markers=len(markers_list) if not is_smith else len(smith_markers_list),
-    )
+    first_df         = list(parsed_files.values())[0]["df"]
+    available_params = get_available_parameters(first_df)
 
-    # threshold annotations 在 marker overlay 加入前提取（純 threshold 標籤）
-    threshold_annotations_json = [ann.to_plotly_json() for ann in fig.layout.annotations]
+    cell_divs               = []
+    base_trace_counts       = [0, 0, 0, 0]
+    shared_shape_index_map  = {}
+    shared_thresh_shape_map = {}
+    shared_thresh_ann       = []
+    tables_children         = []
 
-    # 加上 marker overlay（在此也畫一次，保持初始狀態正確）
-    if is_smith:
-        smith_overlay_traces, smith_marker_values = build_smith_marker_overlays(
+    for cell_idx in range(n_cells):
+        cp   = all_cell_params[cell_idx]
+        cdt  = all_cell_dtypes[cell_idx]
+        cell_y_unit  = get_y_axis_unit(cdt)
+        cell_is_smith = cdt == "smith"
+        cell_thresh_list = [] if cell_is_smith else threshold_markers_list
+
+        fig, threshold_crossings, btc, tsm = build_base_figure(
             files_data=parsed_files,
             visible_filenames=visible_filenames,
-            selected_param=param,
-            smith_markers_list=smith_markers_list,
+            selected_param=cp,
+            selected_data_type=cdt,
+            freq_range=(fmin, fmax),
+            amp_range=(amp_min, amp_max),
+            threshold_markers_list=cell_thresh_list,
+            line_width=line_width,
+            num_markers=len(markers_list) if not cell_is_smith else len(smith_markers_list),
         )
-        for trace in smith_overlay_traces:
-            fig.add_trace(trace)
-        overlay_traces, shapes, annotations, marker_values, shape_index_map = [], [], [], smith_marker_values, {}
-    else:
-        overlay_traces, shapes, annotations, marker_values, shape_index_map = compute_marker_overlay(
-            files_data=parsed_files,
-            visible_filenames=visible_filenames,
-            selected_param=param,
-            selected_data_type=data_type,
-            markers_list=markers_list,
-        )
-        for trace in overlay_traces:
-            fig.add_trace(trace)
-        for shape in shapes:
-            fig.add_shape(**shape)
-        for ann in annotations:
-            fig.add_annotation(**ann)
+        base_trace_counts[cell_idx] = btc
 
-    selected_param_full = f"{param}_{data_type}"
-    y_axis_unit_str = get_y_axis_unit(data_type)
-    n_thresh = len(threshold_shape_map)
-    shape_index_map_str = {str(int(k) + n_thresh): v for k, v in shape_index_map.items()}
-    threshold_shape_map_str = {str(k): v for k, v in threshold_shape_map.items()}
+        if n_cells > 1:
+            fig.update_layout(title=None)
 
-    graph = dcc.Graph(
-        id="main-graph",
-        figure=fig,
-        config={
-            "responsive": True,
-            "displayModeBar": True,
-            "displaylogo": False,
-            "editable": True,
-            "edits": {
-                "shapePosition": True,
-                "annotationPosition": False, "annotationTail": False,
-                "annotationText": False, "axisTitleText": False,
-                "colorbarPosition": False, "legendPosition": False,
-                "legendText": False, "titleText": False,
-            },
-            "toImageButtonOptions": {
-                "format": "png",
-                "filename": f"s_parameter_{selected_param_full}",
-                "height": 800, "width": 1400, "scale": 2,
-            },
-        },
-    )
+        if cell_idx == 0:
+            shared_thresh_ann       = [ann.to_plotly_json() for ann in fig.layout.annotations]
+            shared_thresh_shape_map = {str(k): v for k, v in tsm.items()}
 
-    # 表格區塊放在 id="tables-area" 讓 overlay callback 可以單獨更新
-    tables_children = []
-    if is_smith:
-        if smith_markers_list and marker_values:
-            first_df = list(parsed_files.values())[0]["df"]
-            _, freq_unit_str, _ = auto_convert_frequency(first_df, return_unit_factor=True)
-            smith_df = build_smith_marker_table(marker_values, visible_filenames, freq_unit_str)
-            if not smith_df.empty:
-                tables_children += [
-                    html.H3("📊 Smith Marker Values", style={"fontSize": "16px", "marginTop": "20px"}),
-                    df_to_dash_table(smith_df, "table-smith-markers"),
-                ]
-    else:
-        if markers_list and marker_values:
-            marker_df = build_marker_table(marker_values, visible_filenames, unit, y_axis_unit_str)
-            tables_children += [
-                html.H3("📊 Marker Values Overview", style={"fontSize": "16px", "marginTop": "20px"}),
-                df_to_dash_table(marker_df, "table-markers"),
-            ]
-        if threshold_markers_list and threshold_crossings:
-            thresh_df = build_threshold_table(threshold_crossings, visible_filenames, unit)
-            tables_children += [
-                html.H3("📐 Threshold Crossing Frequencies", style={"fontSize": "16px", "marginTop": "20px"}),
-                df_to_dash_table(thresh_df, "table-thresholds"),
-            ]
-        stats_df = build_stats_table(parsed_files, visible_filenames, selected_param_full, (fmin, fmax))
-        if not stats_df.empty:
-            tables_children += [
-                html.H3("📊 Data Statistics", style={"fontSize": "16px", "marginTop": "20px"}),
-                df_to_dash_table(stats_df, "table-stats"),
-            ]
+        # Marker overlay
+        if cell_is_smith:
+            sm_traces, cell_marker_values = build_smith_marker_overlays(
+                files_data=parsed_files,
+                visible_filenames=visible_filenames,
+                selected_param=cp,
+                smith_markers_list=smith_markers_list,
+            )
+            for trace in sm_traces:
+                fig.add_trace(trace)
+            cell_shape_index_map = {}
+        else:
+            ov_traces, shapes, annotations, cell_marker_values, cell_shape_index_map = compute_marker_overlay(
+                files_data=parsed_files,
+                visible_filenames=visible_filenames,
+                selected_param=cp,
+                selected_data_type=cdt,
+                markers_list=markers_list,
+            )
+            for trace in ov_traces:
+                fig.add_trace(trace)
+            for shape in shapes:
+                fig.add_shape(**shape)
+            for ann in annotations:
+                fig.add_annotation(**ann)
 
+        if cell_idx == 0:
+            n_thresh = len(tsm)
+            shared_shape_index_map = {str(int(k) + n_thresh): v for k, v in cell_shape_index_map.items()}
+
+        # Cell header
+        if cell_idx == 0 and n_cells == 1:
+            cell_header = html.Div(
+                html.Span(f"{cp}  {cell_y_unit}",
+                          style={"fontSize": "12px", "color": "#6c757d", "fontWeight": "500"}),
+                style={"marginBottom": "4px"},
+            )
+        else:
+            dt_opts = get_data_types(first_df, cp)
+            cell_header = html.Div([
+                dcc.Dropdown(
+                    id={"type": "cell-param", "index": cell_idx},
+                    options=available_params, value=cp, clearable=False,
+                    style={"fontSize": "12px", "width": "100px",
+                           "display": "inline-block", "marginRight": "6px"},
+                ),
+                dcc.Dropdown(
+                    id={"type": "cell-datatype", "index": cell_idx},
+                    options=dt_opts, value=cdt, clearable=False,
+                    style={"fontSize": "12px", "width": "110px", "display": "inline-block"},
+                ),
+            ], style={"marginBottom": "4px"})
+
+        cell_divs.append(html.Div([
+            cell_header,
+            html.Div(
+                dcc.Graph(
+                    id={"type": "cell-graph", "index": cell_idx},
+                    figure=fig,
+                    config={
+                        "responsive": True, "displayModeBar": True, "displaylogo": False,
+                        "editable": True,
+                        "edits": {
+                            "shapePosition": True,
+                            "annotationPosition": False, "annotationTail": False,
+                            "annotationText": False, "axisTitleText": False,
+                            "colorbarPosition": False, "legendPosition": False,
+                            "legendText": False, "titleText": False,
+                        },
+                        "toImageButtonOptions": {
+                            "format": "png",
+                            "filename": f"s_parameter_{cp}_{cdt}",
+                            "height": 800, "width": max(1200 // n_cols, 600), "scale": 2,
+                        },
+                    },
+                    style={"height": f"{graph_height}px"},
+                ),
+                className="graph-cell-container",
+                style={"height": f"{graph_height}px", "position": "relative", "overflow": "hidden"},
+            ),
+        ], style={"border": "1px solid #dee2e6", "borderRadius": "6px",
+                  "padding": "6px", "backgroundColor": "#fff"}))
+
+        # Tables: only cell 0
+        if cell_idx == 0:
+            selected_param_full_c0 = f"{cp}_{cdt}"
+            if cell_is_smith:
+                if smith_markers_list and cell_marker_values:
+                    _, freq_unit_str, _ = auto_convert_frequency(first_df, return_unit_factor=True)
+                    smith_df = build_smith_marker_table(cell_marker_values, visible_filenames, freq_unit_str)
+                    if not smith_df.empty:
+                        tables_children += [
+                            html.H3("📊 Smith Marker Values", style={"fontSize": "16px", "marginTop": "20px"}),
+                            df_to_dash_table(smith_df, "table-smith-markers"),
+                        ]
+            else:
+                if markers_list and cell_marker_values:
+                    marker_df = build_marker_table(cell_marker_values, visible_filenames, unit, cell_y_unit)
+                    tables_children += [
+                        html.H3("📊 Marker Values Overview", style={"fontSize": "16px", "marginTop": "20px"}),
+                        df_to_dash_table(marker_df, "table-markers"),
+                    ]
+                tables_children += _build_static_tables(
+                    threshold_markers_list, threshold_crossings,
+                    parsed_files, visible_filenames, selected_param_full_c0,
+                    fmin, fmax, unit, is_smith=False,
+                )
+
+    # Raw data
     raw_sections = []
     for fname in visible_filenames:
         if fname not in parsed_files:
@@ -2224,31 +2645,29 @@ def update_main(
             html.Div(raw_sections),
         ]
 
-    graph_height = fig.layout.height or 600
-
     content_children = [
-        # 明確給高度的 block 容器，防止 responsive 模式造成表格重疊
-        html.Div(
-            graph,
-            style={
-                "height": f"{graph_height}px",
-                "display": "block",
-                "position": "relative",
-                "width": "100%",
-            },
-        ),
-        html.Div(id="tables-area", children=tables_children,
-                 style={"display": "block", "width": "100%", "marginTop": "4px"}),
+        html.Div(cell_divs, id="cell-grid", **{"data-rows": str(n_rows)}, style={
+            "display": "grid",
+            "gridTemplateColumns": f"repeat({n_cols}, 1fr)",
+            "gap": "8px",
+        }),
     ]
 
-    return content_children, shape_index_map_str, base_trace_count, threshold_shape_map_str, threshold_annotations_json
+    return (
+        content_children,
+        tables_children,
+        shared_shape_index_map,
+        base_trace_counts,
+        shared_thresh_shape_map,
+        shared_thresh_ann,
+    )
 
 
 # ── 12. 圖上拖動 marker/threshold → 同步 sidebar ──────────
 @callback(
     Output({"type": "marker-freq",    "index": ALL}, "value"),
     Output({"type": "threshold-value","index": ALL}, "value"),
-    Input("main-graph", "relayoutData"),
+    Input({"type": "cell-graph", "index": ALL}, "relayoutData"),
     State("store-shape-index-map",     "data"),
     State("store-threshold-shape-map", "data"),
     State({"type": "marker-freq",    "index": ALL}, "value"),
@@ -2256,15 +2675,21 @@ def update_main(
     prevent_initial_call=True,
 )
 def sync_marker_from_drag(
-    relayout_data,
+    relayout_data_list,
     shape_index_map, threshold_shape_map,
     current_freqs, current_thresholds,
 ):
-    """
-    拖動後同步 sidebar input：
-    - 垂直 marker shape  → x0/x1 → 更新 marker-freq
-    - 水平 threshold shape → y0/y1 → 更新 threshold-value
-    """
+    triggered = ctx.triggered_id
+    if not triggered or not isinstance(triggered, dict):
+        raise PreventUpdate
+
+    triggered_cell = triggered["index"]
+    relayout_data = None
+    for i, item in enumerate(ctx.inputs_list[0]):
+        if item["id"]["index"] == triggered_cell:
+            relayout_data = relayout_data_list[i]
+            break
+
     if not relayout_data:
         raise PreventUpdate
 
@@ -2325,10 +2750,10 @@ def sync_marker_from_drag(
     return new_freqs, new_thresholds
 
 
-# ── 12a. marker freq 變動 / marker 數量歸零 → 輕量更新 overlay trace + 表格 ─
+# ── 12a. marker 變動 → 輕量更新所有 cell overlay trace + 表格 ─
 @callback(
-    Output("main-graph", "figure"),
-    Output("tables-area", "children"),
+    Output({"type": "cell-graph", "index": ALL}, "figure"),
+    Output("tables-area", "children", allow_duplicate=True),
     Output("store-shape-index-map", "data", allow_duplicate=True),
     Input({"type": "marker-freq",        "index": ALL}, "value"),
     Input({"type": "marker-color",       "index": ALL}, "value"),
@@ -2350,6 +2775,7 @@ def sync_marker_from_drag(
     State({"type": "threshold-value", "index": ALL}, "value"),
     State({"type": "threshold-color", "index": ALL}, "value"),
     State("num-thresholds", "data"),
+    State("store-cell-configs", "data"),
     prevent_initial_call=True,
 )
 def update_marker_overlay(
@@ -2358,191 +2784,157 @@ def update_marker_overlay(
     sm_freqs, sm_colors,
     smith_marker_store,
     files_data, param, data_type,
-    visible_filenames, base_trace_count,
+    visible_filenames, base_trace_counts,
     freq_meta, fmin, fmax,
     threshold_shape_map,
     threshold_annotations_stored,
     t_values, t_colors,
     threshold_store,
+    cell_configs,
 ):
-    """只更新 marker overlay（shapes + 讀值 trace），不重畫主曲線。
-    同時重建 threshold / stats 表格，確保它們不因 marker 更新而消失。"""
     if not files_data or not param or not data_type:
         raise PreventUpdate
 
     from dash import Patch
-    base_trace_count = base_trace_count or 0
+
+    # Normalise base_trace_counts to list
+    if not isinstance(base_trace_counts, list):
+        base_trace_counts = [base_trace_counts or 0] * 4
+
     freq_meta = freq_meta or {}
     unit = freq_meta.get("unit", "GHz")
-    y_axis_unit = get_y_axis_unit(data_type)
-    selected_param_full = f"{param}_{data_type}"
-    is_smith = data_type == "smith"
+    y_axis_unit_c0 = get_y_axis_unit(data_type)
+    is_smith_c0 = data_type == "smith"
     n_threshold_shapes = len(threshold_shape_map) if threshold_shape_map else 0
     threshold_annotations_stored = threshold_annotations_stored or []
 
-    parsed_files = {}
-    for fn, fdata in files_data.items():
-        parsed_files[fn] = {"df": pd.read_json(io.StringIO(fdata["df_json"]), orient="split", convert_dates=False)}
-
+    parsed_files = _parse_files(files_data)
     visible_filenames = visible_filenames if visible_filenames else list(files_data.keys())
     fmin = fmin if fmin is not None else freq_meta.get("disp_min", 0)
     fmax = fmax if fmax is not None else freq_meta.get("disp_max", 1)
 
-    # 重建 threshold crossing 表格所需資料
-    threshold_markers_list = []
-    threshold_store = threshold_store or {}
-    t_store_ids = list(threshold_store.keys())
-    for i, t_val in enumerate(t_values or []):
-        if t_val is None:
-            continue
-        t_id_str = t_store_ids[i] if i < len(t_store_ids) else str(i + 1)
-        threshold_markers_list.append({
-            "value": t_val,
-            "label": f"T{t_id_str}: {t_val:.1f} {y_axis_unit}",
-            "color": t_colors[i] if i < len(t_colors) and t_colors[i] else DEFAULT_MARKER_COLORS[i % 10],
-        })
-
-    threshold_crossings: dict = {}
-    if threshold_markers_list and not is_smith:
-        for t_marker in threshold_markers_list:
-            t_label = t_marker["label"]
-            t_val = t_marker["value"]
-            threshold_crossings[t_label] = {}
-            for fname, finfo in parsed_files.items():
-                df_conv, _ = auto_convert_frequency(finfo["df"])
-                if selected_param_full not in df_conv.columns:
-                    continue
-                df_filt = filter_by_frequency_range(df_conv, fmin, fmax)
-                crossings = find_threshold_crossings(df_filt, selected_param_full, t_val)
-                threshold_crossings[t_label][get_display_name(fname)] = crossings
-
-    # 靜態表格（threshold crossing + data statistics）
-    static_tables = []
-    if threshold_markers_list and threshold_crossings:
-        thresh_df = build_threshold_table(threshold_crossings, visible_filenames, unit)
-        static_tables += [
-            html.H3("📐 Threshold Crossing Frequencies", style={"fontSize": "16px", "marginTop": "20px"}),
-            df_to_dash_table(thresh_df, "table-thresholds"),
-        ]
-    if not is_smith:
-        stats_df = build_stats_table(parsed_files, visible_filenames, selected_param_full, (fmin, fmax))
-        if not stats_df.empty:
-            static_tables += [
-                html.H3("📊 Data Statistics", style={"fontSize": "16px", "marginTop": "20px"}),
-                df_to_dash_table(stats_df, "table-stats"),
-            ]
+    # Pre-compute shared threshold data (based on cell 0)
+    threshold_markers_list = _build_threshold_markers_list(t_values, t_colors, None, threshold_store, y_axis_unit_c0)
+    threshold_crossings = _compute_threshold_crossings(
+        threshold_markers_list, parsed_files, f"{param}_{data_type}", fmin, fmax,
+    ) if threshold_markers_list and not is_smith_c0 else {}
+    static_tables_c0 = _build_static_tables(
+        threshold_markers_list, threshold_crossings,
+        parsed_files, visible_filenames, f"{param}_{data_type}",
+        fmin, fmax, unit, is_smith_c0,
+    )
 
     _invisible_shape = dict(
-        type="line", x0=0, x1=0, y0=0, y1=0,
-        xref="paper", yref="paper",
+        type="line", x0=0, x1=0, y0=0, y1=0, xref="paper", yref="paper",
         line=dict(color="rgba(0,0,0,0)", width=0), opacity=0,
     )
-    _empty_scatter      = {"type": "scatter",      "x": [],    "y": [],    "showlegend": False, "hoverinfo": "skip"}
-    _empty_scattersmith = {"type": "scattersmith",  "real": [], "imag": [], "showlegend": False, "hoverinfo": "skip"}
-    patched_fig = Patch()
+    _empty_scatter      = {"type": "scatter",     "x": [],    "y": [],    "showlegend": False, "hoverinfo": "skip"}
+    _empty_scattersmith = {"type": "scattersmith", "real": [], "imag": [], "showlegend": False, "hoverinfo": "skip"}
 
-    # ── Smith Chart 路徑 ──────────────────────────────────
-    if is_smith:
-        sm_store_ids = list((smith_marker_store or {}).keys())
-        smith_markers_list = []
-        for i, freq_val in enumerate(sm_freqs or []):
-            if freq_val is None:
-                continue
-            sm_id_str = sm_store_ids[i] if i < len(sm_store_ids) else str(i + 1)
-            smith_markers_list.append({
-                "freq":  freq_val,
-                "label": f"M{sm_id_str}: {freq_val:.3f} {unit}",
-                "color": sm_colors[i] if i < len(sm_colors) and sm_colors[i] else DEFAULT_MARKER_COLORS[i % 10],
-            })
+    cell_configs = list(cell_configs or [])
 
-        for i in range(50):
-            patched_fig["data"][base_trace_count + i] = _empty_scattersmith
+    def cell_param_dtype(cell_idx):
+        if cell_idx == 0:
+            return param, data_type
+        cfg = cell_configs[cell_idx - 1] if cell_idx - 1 < len(cell_configs) else {}
+        return cfg.get("param") or param, cfg.get("data_type") or data_type
 
-        if not smith_markers_list:
-            return patched_fig, [], {}
-
-        overlay_traces, marker_values = build_smith_marker_overlays(
-            files_data=parsed_files,
-            visible_filenames=visible_filenames,
-            selected_param=param,
-            smith_markers_list=smith_markers_list,
-        )
-        for i, trace in enumerate(overlay_traces):
-            patched_fig["data"][base_trace_count + i] = trace.to_plotly_json()
-
-        tables_children = []
-        if marker_values:
-            _, freq_unit_str, _ = auto_convert_frequency(
-                list(parsed_files.values())[0]["df"], return_unit_factor=True
-            )
-            smith_df = build_smith_marker_table(marker_values, visible_filenames, freq_unit_str)
-            if not smith_df.empty:
-                tables_children = [
-                    html.H3("📊 Smith Marker Values", style={"fontSize": "16px", "marginTop": "20px"}),
-                    df_to_dash_table(smith_df, "table-smith-markers"),
-                ]
-        return patched_fig, tables_children, {}
-
-    # ── 非 Smith 路徑 ─────────────────────────────────────
-    # marker 全部清空時：清除 marker shapes 和 overlay traces，保留 threshold annotations
-    if not m_freqs or not marker_store:
-        patched_fig["layout"]["annotations"] = list(threshold_annotations_stored)
-        for i in range(50):
-            patched_fig["layout"]["shapes"][n_threshold_shapes + i] = _invisible_shape
-        for i in range(50):
-            patched_fig["data"][base_trace_count + i] = _empty_scatter
-        return patched_fig, static_tables, {}
-
-    store_ids = list(marker_store.keys())
-    markers_list = []
-    for i, freq_val in enumerate(m_freqs):
-        if freq_val is None:
-            continue
-        m_id_str = store_ids[i] if i < len(store_ids) else str(i + 1)
-        markers_list.append({
-            "freq":           freq_val,
-            "label":          f"M{m_id_str}: {freq_val:.3f} {unit}",
-            "color":          m_colors[i] if i < len(m_colors) and m_colors[i] else DEFAULT_MARKER_COLORS[i % 10],
-            "style":          "vertical",
-            "show_in_legend": bool(m_shows[i]) if i < len(m_shows) else True,
-        })
-
-    overlay_traces, shapes, annotations, marker_values, shape_index_map = compute_marker_overlay(
-        files_data=parsed_files,
-        visible_filenames=visible_filenames,
-        selected_param=param,
-        selected_data_type=data_type,
-        markers_list=markers_list,
-    )
-
-    offset_shape_index_map = {
-        str(int(k) + n_threshold_shapes): v
-        for k, v in shape_index_map.items()
-    }
-
-    for i, s in enumerate(shapes):
-        patched_fig["layout"]["shapes"][n_threshold_shapes + i] = s
-    for i in range(len(shapes), 50):
-        patched_fig["layout"]["shapes"][n_threshold_shapes + i] = _invisible_shape
-
-    patched_fig["layout"]["annotations"] = list(threshold_annotations_stored) + list(annotations)
-
-    new_data = [t.to_plotly_json() for t in overlay_traces]
-    for i in range(50):
-        patched_fig["data"][base_trace_count + i] = _empty_scatter
-    for i, trace_json in enumerate(new_data):
-        patched_fig["data"][base_trace_count + i] = trace_json
-
+    patches = []
     tables_children = []
-    if markers_list and marker_values:
-        marker_df = build_marker_table(marker_values, visible_filenames, unit, y_axis_unit)
-        tables_children += [
-            html.H3("📊 Marker Values Overview", style={"fontSize": "16px", "marginTop": "20px"}),
-            df_to_dash_table(marker_df, "table-markers"),
-        ]
-    tables_children += static_tables
+    updated_shape_index_map = {}
 
-    return patched_fig, tables_children, offset_shape_index_map
+    for output_item in ctx.outputs_list[0]:
+        cell_idx = output_item["id"]["index"]
+        cp, cdt = cell_param_dtype(cell_idx)
+        cell_is_smith = cdt == "smith"
+        cell_btc = base_trace_counts[cell_idx] if cell_idx < len(base_trace_counts) else 0
+        cell_y_unit = get_y_axis_unit(cdt)
+
+        patched_fig = Patch()
+
+        if cell_is_smith:
+            smith_markers_list = _build_smith_markers_list(sm_freqs, sm_colors, smith_marker_store, unit)
+            for i in range(50):
+                patched_fig["data"][cell_btc + i] = _empty_scattersmith
+
+            if not smith_markers_list:
+                if cell_idx == 0:
+                    tables_children = []
+                patches.append(patched_fig)
+                continue
+
+            ov_traces, marker_values = build_smith_marker_overlays(
+                files_data=parsed_files,
+                visible_filenames=visible_filenames,
+                selected_param=cp,
+                smith_markers_list=smith_markers_list,
+            )
+            for i, trace in enumerate(ov_traces):
+                patched_fig["data"][cell_btc + i] = trace.to_plotly_json()
+
+            if cell_idx == 0:
+                tables_children = []
+                if marker_values:
+                    _, freq_unit_str, _ = auto_convert_frequency(
+                        list(parsed_files.values())[0]["df"], return_unit_factor=True,
+                    )
+                    smith_df = build_smith_marker_table(marker_values, visible_filenames, freq_unit_str)
+                    if not smith_df.empty:
+                        tables_children = [
+                            html.H3("📊 Smith Marker Values", style={"fontSize": "16px", "marginTop": "20px"}),
+                            df_to_dash_table(smith_df, "table-smith-markers"),
+                        ]
+
+        else:
+            # Non-Smith
+            if not m_freqs or not marker_store:
+                patched_fig["layout"]["annotations"] = list(threshold_annotations_stored)
+                for i in range(50):
+                    patched_fig["layout"]["shapes"][n_threshold_shapes + i] = _invisible_shape
+                for i in range(50):
+                    patched_fig["data"][cell_btc + i] = _empty_scatter
+                if cell_idx == 0:
+                    tables_children = static_tables_c0
+                patches.append(patched_fig)
+                continue
+
+            markers_list = _build_markers_list(m_freqs, m_colors, m_shows, marker_store, unit)
+            ov_traces, shapes, annotations, marker_values, cell_sim = compute_marker_overlay(
+                files_data=parsed_files,
+                visible_filenames=visible_filenames,
+                selected_param=cp,
+                selected_data_type=cdt,
+                markers_list=markers_list,
+            )
+
+            for i, s in enumerate(shapes):
+                patched_fig["layout"]["shapes"][n_threshold_shapes + i] = s
+            for i in range(len(shapes), 50):
+                patched_fig["layout"]["shapes"][n_threshold_shapes + i] = _invisible_shape
+            patched_fig["layout"]["annotations"] = list(threshold_annotations_stored) + list(annotations)
+
+            new_data = [t.to_plotly_json() for t in ov_traces]
+            for i in range(50):
+                patched_fig["data"][cell_btc + i] = _empty_scatter
+            for i, trace_json in enumerate(new_data):
+                patched_fig["data"][cell_btc + i] = trace_json
+
+            if cell_idx == 0:
+                tables_children = []
+                if markers_list and marker_values:
+                    marker_df = build_marker_table(marker_values, visible_filenames, unit, cell_y_unit)
+                    tables_children += [
+                        html.H3("📊 Marker Values Overview", style={"fontSize": "16px", "marginTop": "20px"}),
+                        df_to_dash_table(marker_df, "table-markers"),
+                    ]
+                tables_children += static_tables_c0
+                updated_shape_index_map = {
+                    str(int(k) + n_threshold_shapes): v for k, v in cell_sim.items()
+                }
+
+        patches.append(patched_fig)
+
+    return patches, tables_children, updated_shape_index_map
 
 
 # ============================================================
