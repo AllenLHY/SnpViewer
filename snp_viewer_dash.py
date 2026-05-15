@@ -821,32 +821,18 @@ def _compute_threshold_crossings(
     return crossings
 
 
-def _build_static_tables(
-    threshold_markers_list: list,
-    threshold_crossings: dict,
-    parsed_files: dict,
-    visible_filenames: list,
-    selected_param_full: str,
-    fmin: float,
-    fmax: float,
-    unit: str,
-    is_smith: bool,
-) -> list:
-    tables = []
+def _get_threshold_table(threshold_markers_list, threshold_crossings, visible_filenames, unit, cell_idx):
     if threshold_markers_list and threshold_crossings:
         thresh_df = build_threshold_table(threshold_crossings, visible_filenames, unit)
-        tables += [
-            html.H3("📐 Threshold Crossing Frequencies", style={"fontSize": "16px", "marginTop": "20px"}),
-            df_to_dash_table(thresh_df, "table-thresholds"),
-        ]
-    if not is_smith:
-        stats_df = build_stats_table(parsed_files, visible_filenames, selected_param_full, (fmin, fmax))
-        if not stats_df.empty:
-            tables += [
-                html.H3("📊 Data Statistics", style={"fontSize": "16px", "marginTop": "20px"}),
-                df_to_dash_table(stats_df, "table-stats"),
-            ]
-    return tables
+        return df_to_dash_table(thresh_df, f"table-thresholds-{cell_idx}")
+    return None
+
+
+def _get_stats_table(parsed_files, visible_filenames, selected_param_full, fmin, fmax, cell_idx):
+    stats_df = build_stats_table(parsed_files, visible_filenames, selected_param_full, (fmin, fmax))
+    if not stats_df.empty:
+        return df_to_dash_table(stats_df, f"table-stats-{cell_idx}")
+    return None
 
 
 # ============================================================
@@ -2491,6 +2477,10 @@ def update_main(
     shared_thresh_shape_map = {}
     shared_thresh_ann       = []
     tables_children         = []
+    smith_marker_items      = []
+    marker_items            = []
+    threshold_items         = []
+    stats_items             = []
 
     for cell_idx in range(n_cells):
         cp   = all_cell_params[cell_idx]
@@ -2602,30 +2592,43 @@ def update_main(
         ], style={"border": "1px solid #dee2e6", "borderRadius": "6px",
                   "padding": "6px", "backgroundColor": "#fff"}))
 
-        # Tables: only cell 0
-        if cell_idx == 0:
-            selected_param_full_c0 = f"{cp}_{cdt}"
-            if cell_is_smith:
-                if smith_markers_list and cell_marker_values:
-                    _, freq_unit_str, _ = auto_convert_frequency(first_df, return_unit_factor=True)
-                    smith_df = build_smith_marker_table(cell_marker_values, visible_filenames, freq_unit_str)
-                    if not smith_df.empty:
-                        tables_children += [
-                            html.H3("📊 Smith Marker Values", style={"fontSize": "16px", "marginTop": "20px"}),
-                            df_to_dash_table(smith_df, "table-smith-markers"),
-                        ]
-            else:
-                if markers_list and cell_marker_values:
-                    marker_df = build_marker_table(cell_marker_values, visible_filenames, unit, cell_y_unit)
-                    tables_children += [
-                        html.H3("📊 Marker Values Overview", style={"fontSize": "16px", "marginTop": "20px"}),
-                        df_to_dash_table(marker_df, "table-markers"),
-                    ]
-                tables_children += _build_static_tables(
-                    threshold_markers_list, threshold_crossings,
-                    parsed_files, visible_filenames, selected_param_full_c0,
-                    fmin, fmax, unit, is_smith=False,
-                )
+        # Tables: collect per section type
+        _cell_label = f"{cp}_{cdt}"
+        _cell_hdr = html.Div([
+            html.Span(cp,  style={"fontWeight": "600", "marginRight": "6px"}),
+            html.Span(cdt, style={"color": "#6c757d", "fontSize": "12px"}),
+        ], style={"fontSize": "13px", "color": "#495057",
+                  "borderBottom": "1px solid #dee2e6", "paddingBottom": "4px",
+                  "marginTop": "12px", "marginBottom": "6px"})
+        if cell_is_smith:
+            if smith_markers_list and cell_marker_values:
+                _, freq_unit_str, _ = auto_convert_frequency(first_df, return_unit_factor=True)
+                smith_df = build_smith_marker_table(cell_marker_values, visible_filenames, freq_unit_str)
+                if not smith_df.empty:
+                    smith_marker_items.append((_cell_hdr, df_to_dash_table(smith_df, f"table-smith-markers-{cell_idx}")))
+        else:
+            if markers_list and cell_marker_values:
+                marker_df = build_marker_table(cell_marker_values, visible_filenames, unit, cell_y_unit)
+                marker_items.append((_cell_hdr, df_to_dash_table(marker_df, f"table-markers-{cell_idx}")))
+            thresh_tbl = _get_threshold_table(threshold_markers_list, threshold_crossings, visible_filenames, unit, cell_idx)
+            if thresh_tbl is not None:
+                threshold_items.append((_cell_hdr, thresh_tbl))
+            stats_tbl = _get_stats_table(parsed_files, visible_filenames, _cell_label, fmin, fmax, cell_idx)
+            if stats_tbl is not None:
+                stats_items.append((_cell_hdr, stats_tbl))
+
+    # Assemble tables grouped by section type
+    _h3_style = {"fontSize": "16px", "marginTop": "20px"}
+    for _title, _items in [
+        ("📊 Smith Marker Values",            smith_marker_items),
+        ("📊 Marker Values Overview",         marker_items),
+        ("📐 Threshold Crossing Frequencies", threshold_items),
+        ("📊 Data Statistics",                stats_items),
+    ]:
+        if _items:
+            tables_children.append(html.H3(_title, style=_h3_style))
+            for _hdr, _tbl in _items:
+                tables_children += [_hdr, _tbl]
 
     # Raw data
     raw_sections = []
@@ -2641,7 +2644,7 @@ def update_main(
         ], style={"marginBottom": "12px"}))
     if raw_sections:
         tables_children += [
-            html.H3("📋 Raw Data", style={"fontSize": "16px", "marginTop": "20px"}),
+            html.H3("📋 Raw Data", style=_h3_style),
             html.Div(raw_sections),
         ]
 
@@ -2804,7 +2807,6 @@ def update_marker_overlay(
     freq_meta = freq_meta or {}
     unit = freq_meta.get("unit", "GHz")
     y_axis_unit_c0 = get_y_axis_unit(data_type)
-    is_smith_c0 = data_type == "smith"
     n_threshold_shapes = len(threshold_shape_map) if threshold_shape_map else 0
     threshold_annotations_stored = threshold_annotations_stored or []
 
@@ -2813,16 +2815,7 @@ def update_marker_overlay(
     fmin = fmin if fmin is not None else freq_meta.get("disp_min", 0)
     fmax = fmax if fmax is not None else freq_meta.get("disp_max", 1)
 
-    # Pre-compute shared threshold data (based on cell 0)
     threshold_markers_list = _build_threshold_markers_list(t_values, t_colors, None, threshold_store, y_axis_unit_c0)
-    threshold_crossings = _compute_threshold_crossings(
-        threshold_markers_list, parsed_files, f"{param}_{data_type}", fmin, fmax,
-    ) if threshold_markers_list and not is_smith_c0 else {}
-    static_tables_c0 = _build_static_tables(
-        threshold_markers_list, threshold_crossings,
-        parsed_files, visible_filenames, f"{param}_{data_type}",
-        fmin, fmax, unit, is_smith_c0,
-    )
 
     _invisible_shape = dict(
         type="line", x0=0, x1=0, y0=0, y1=0, xref="paper", yref="paper",
@@ -2841,6 +2834,10 @@ def update_marker_overlay(
 
     patches = []
     tables_children = []
+    smith_marker_items = []
+    marker_items       = []
+    threshold_items    = []
+    stats_items        = []
     updated_shape_index_map = {}
 
     for output_item in ctx.outputs_list[0]:
@@ -2850,6 +2847,17 @@ def update_marker_overlay(
         cell_btc = base_trace_counts[cell_idx] if cell_idx < len(base_trace_counts) else 0
         cell_y_unit = get_y_axis_unit(cdt)
 
+        _cell_thresh_list = [] if cell_is_smith else threshold_markers_list
+        _cell_thresh_crossings = _compute_threshold_crossings(
+            _cell_thresh_list, parsed_files, f"{cp}_{cdt}", fmin, fmax,
+        ) if _cell_thresh_list else {}
+        _cell_hdr = html.Div([
+            html.Span(cp,  style={"fontWeight": "600", "marginRight": "6px"}),
+            html.Span(cdt, style={"color": "#6c757d", "fontSize": "12px"}),
+        ], style={"fontSize": "13px", "color": "#495057",
+                  "borderBottom": "1px solid #dee2e6", "paddingBottom": "4px",
+                  "marginTop": "12px", "marginBottom": "6px"})
+
         patched_fig = Patch()
 
         if cell_is_smith:
@@ -2858,8 +2866,6 @@ def update_marker_overlay(
                 patched_fig["data"][cell_btc + i] = _empty_scattersmith
 
             if not smith_markers_list:
-                if cell_idx == 0:
-                    tables_children = []
                 patches.append(patched_fig)
                 continue
 
@@ -2872,18 +2878,13 @@ def update_marker_overlay(
             for i, trace in enumerate(ov_traces):
                 patched_fig["data"][cell_btc + i] = trace.to_plotly_json()
 
-            if cell_idx == 0:
-                tables_children = []
-                if marker_values:
-                    _, freq_unit_str, _ = auto_convert_frequency(
-                        list(parsed_files.values())[0]["df"], return_unit_factor=True,
-                    )
-                    smith_df = build_smith_marker_table(marker_values, visible_filenames, freq_unit_str)
-                    if not smith_df.empty:
-                        tables_children = [
-                            html.H3("📊 Smith Marker Values", style={"fontSize": "16px", "marginTop": "20px"}),
-                            df_to_dash_table(smith_df, "table-smith-markers"),
-                        ]
+            if marker_values:
+                _, freq_unit_str, _ = auto_convert_frequency(
+                    list(parsed_files.values())[0]["df"], return_unit_factor=True,
+                )
+                smith_df = build_smith_marker_table(marker_values, visible_filenames, freq_unit_str)
+                if not smith_df.empty:
+                    smith_marker_items.append((_cell_hdr, df_to_dash_table(smith_df, f"table-smith-markers-{cell_idx}")))
 
         else:
             # Non-Smith
@@ -2893,8 +2894,12 @@ def update_marker_overlay(
                     patched_fig["layout"]["shapes"][n_threshold_shapes + i] = _invisible_shape
                 for i in range(50):
                     patched_fig["data"][cell_btc + i] = _empty_scatter
-                if cell_idx == 0:
-                    tables_children = static_tables_c0
+                thresh_tbl = _get_threshold_table(_cell_thresh_list, _cell_thresh_crossings, visible_filenames, unit, cell_idx)
+                if thresh_tbl is not None:
+                    threshold_items.append((_cell_hdr, thresh_tbl))
+                stats_tbl = _get_stats_table(parsed_files, visible_filenames, f"{cp}_{cdt}", fmin, fmax, cell_idx)
+                if stats_tbl is not None:
+                    stats_items.append((_cell_hdr, stats_tbl))
                 patches.append(patched_fig)
                 continue
 
@@ -2919,20 +2924,33 @@ def update_marker_overlay(
             for i, trace_json in enumerate(new_data):
                 patched_fig["data"][cell_btc + i] = trace_json
 
-            if cell_idx == 0:
-                tables_children = []
-                if markers_list and marker_values:
-                    marker_df = build_marker_table(marker_values, visible_filenames, unit, cell_y_unit)
-                    tables_children += [
-                        html.H3("📊 Marker Values Overview", style={"fontSize": "16px", "marginTop": "20px"}),
-                        df_to_dash_table(marker_df, "table-markers"),
-                    ]
-                tables_children += static_tables_c0
-                updated_shape_index_map = {
-                    str(int(k) + n_threshold_shapes): v for k, v in cell_sim.items()
-                }
+            if markers_list and marker_values:
+                marker_df = build_marker_table(marker_values, visible_filenames, unit, cell_y_unit)
+                marker_items.append((_cell_hdr, df_to_dash_table(marker_df, f"table-markers-{cell_idx}")))
+            thresh_tbl = _get_threshold_table(_cell_thresh_list, _cell_thresh_crossings, visible_filenames, unit, cell_idx)
+            if thresh_tbl is not None:
+                threshold_items.append((_cell_hdr, thresh_tbl))
+            stats_tbl = _get_stats_table(parsed_files, visible_filenames, f"{cp}_{cdt}", fmin, fmax, cell_idx)
+            if stats_tbl is not None:
+                stats_items.append((_cell_hdr, stats_tbl))
+            updated_shape_index_map = {
+                str(int(k) + n_threshold_shapes): v for k, v in cell_sim.items()
+            }
 
         patches.append(patched_fig)
+
+    # Assemble tables grouped by section type
+    _h3_style = {"fontSize": "16px", "marginTop": "20px"}
+    for _title, _items in [
+        ("📊 Smith Marker Values",            smith_marker_items),
+        ("📊 Marker Values Overview",         marker_items),
+        ("📐 Threshold Crossing Frequencies", threshold_items),
+        ("📊 Data Statistics",                stats_items),
+    ]:
+        if _items:
+            tables_children.append(html.H3(_title, style=_h3_style))
+            for _hdr, _tbl in _items:
+                tables_children += [_hdr, _tbl]
 
     return patches, tables_children, updated_shape_index_map
 
