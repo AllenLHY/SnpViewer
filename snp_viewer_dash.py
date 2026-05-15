@@ -45,7 +45,7 @@ warnings.filterwarnings("ignore", message=".*keyword arguments have been depreca
 # ============================================================
 # Version
 # ============================================================
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 
 # v1.0.4  2026-05-07
 #   - feat: Smith marker click-to-set — click on Smith curve to move a marker

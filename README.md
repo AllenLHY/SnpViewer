@@ -36,6 +36,10 @@ python snp_viewer_dash.py
 
 ## Changelog
 
+### v1.1.1
+- Table area restructured: section headings (Marker Values / Threshold / Data Statistics) now appear once, with per-cell sub-headers below
+- Fix threshold and Data Statistics tables not rendering in multi-cell mode
+
 ### v1.1.0
 - Multi-cell layout support (1×1 / 1×2 / 2×1 / 2×2) with shared markers
 - Per-cell inline param/datatype dropdowns
